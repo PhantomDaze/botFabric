@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package botfabric.v1;
+
+option go_package = "github.com/PhantomDaze/botfabric/gen/botfabric/v1;botfabricv1";
+
+// ProcessPlugin 定义外部插件控制面与数据面的稳定边界。
+service ProcessPlugin {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc Invoke(InvokeRequest) returns (InvokeResponse);
+  rpc Subscribe(SubscribeRequest) returns (stream EventEnvelope);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+message HandshakeRequest {
+  string plugin_id = 1;
+  string plugin_version = 2;
+  repeated string capabilities = 3;
+  string protocol_version = 4;
+}
+
+message HandshakeResponse {
+  bool accepted = 1;
+  string session_token = 2;
+  int64 expires_unix_seconds = 3;
+  string error_code = 4;
+  string message = 5;
+}
+
+message InvokeRequest {
+  string service = 1;
+  string method = 2;
+  string trace_id = 3;
+  string correlation_id = 4;
+  map<string, string> metadata = 5;
+  bytes payload = 6;
+  string session_token = 7;
+}
+
+message InvokeResponse {
+  bytes payload = 1;
+  ServiceError error = 2;
+}
+
+message SubscribeRequest {
+  repeated string topics = 1;
+  string session_token = 2;
+}
+
+message EventEnvelope {
+  string id = 1;
+  string topic = 2;
+  string schema = 3;
+  int64 timestamp_unix_millis = 4;
+  string source = 5;
+  string bot_id = 6;
+  string correlation_id = 7;
+  string trace_id = 8;
+  map<string, string> headers = 9;
+  bytes payload = 10;
+}
+
+message HealthRequest {
+  string session_token = 1;
+}
+
+message HealthResponse {
+  string state = 1;
+  string message = 2;
+  map<string, string> details = 3;
+}
+
+message ShutdownRequest {
+  string session_token = 1;
+  int64 deadline_unix_millis = 2;
+}
+
+message ShutdownResponse {
+  bool accepted = 1;
+}
+
+message ServiceError {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+  map<string, string> details = 4;
+}

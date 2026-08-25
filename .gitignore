@@ -1,0 +1,20 @@
+# 构建产物
+/bin/
+/dist/
+*.test
+*.out
+
+# 运行时数据
+/run/
+*.sock
+*.pid
+
+# 本地配置与密钥
+.env
+config/runtime.yaml
+config/policy.yaml
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
