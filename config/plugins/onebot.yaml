@@ -1,0 +1,20 @@
+id: protocol.onebot
+name: OneBot v11/v12 Protocol
+version: 0.1.0
+runtime: in_process
+entry: builtin.onebot
+
+provides:
+  services:
+    - name: protocol.qq.action
+      methods:
+        - SendMessage
+  subscriptions: []
+
+requires:
+  services: []
+  permissions: []
+
+limits:
+  timeout: 5s
+  memory: ""

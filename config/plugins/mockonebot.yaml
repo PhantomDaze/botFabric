@@ -1,0 +1,20 @@
+id: protocol.mockonebot
+name: Mock OneBot Protocol
+version: 0.1.0
+runtime: in_process
+entry: builtin.mockonebot
+
+provides:
+  services:
+    - name: protocol.qq.action
+      methods:
+        - SendMessage
+  subscriptions: []
+
+requires:
+  services: []
+  permissions: []
+
+limits:
+  timeout: 2s
+  memory: ""
