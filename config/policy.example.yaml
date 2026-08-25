@@ -1,0 +1,31 @@
+default: deny
+plugins:
+  protocol.mockonebot:
+    publish:
+      - bot.message.group
+    subscribe: []
+    invoke: []
+    provide:
+      - protocol.qq.action
+
+  protocol.onebot:
+    publish:
+      - bot.message.group
+    subscribe: []
+    invoke: []
+    provide:
+      - protocol.qq.action
+
+  example.reply:
+    publish: []
+    subscribe:
+      - bot.message.group
+    invoke:
+      - service: botfabric.response
+        methods:
+          - Submit
+          - Cancel
+      - service: protocol.qq.action
+        methods:
+          - SendMessage
+    provide: []

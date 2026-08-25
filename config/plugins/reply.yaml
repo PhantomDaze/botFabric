@@ -1,0 +1,22 @@
+id: example.reply
+name: Example Reply
+version: 0.1.0
+runtime: in_process
+entry: builtin.reply
+
+provides:
+  services: []
+  subscriptions:
+    - bot.message.group
+
+requires:
+  services:
+    - botfabric.response
+    - protocol.qq.action
+  permissions:
+    - event.read.message
+    - action.send_message
+
+limits:
+  timeout: 2s
+  memory: ""
