@@ -1,0 +1,46 @@
+runtime:
+  plugin_directory: ./config/plugins
+  shutdown_timeout: 10s
+  default_handler_timeout: 2s
+  bot_id: mock-bot
+
+transport:
+  unix_socket_directory: ./run
+  max_message_size: 4MiB
+
+policy:
+  file: ./config/policy.example.yaml
+  default: deny
+
+observability:
+  log_format: json
+  metrics_enabled: true
+  tracing_enabled: false
+
+onebot:
+  enabled: false
+  listen_address: 127.0.0.1:8090
+  path_v11: /onebot/v11
+  path_v12: /onebot/v12
+  access_token: change-me
+  connect_timeout: 10s
+  heartbeat_interval: 30s
+  max_message_size: 4MiB
+
+application_onebot:
+  enabled: false
+  mode: server # server / client / both
+  listen_address: 127.0.0.1:8091
+  path_v11: /application/v11
+  path_v12: /application/v12
+  access_token: change-me
+  read_timeout: 10s
+  write_timeout: 5s
+  remote_address: 127.0.0.1:8092
+  remote_path: /onebot
+  remote_version: v11
+
+management:
+  enabled: false
+  listen_address: 127.0.0.1:9090
+  bearer_token: change-me-in-production
