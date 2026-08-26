@@ -3,7 +3,6 @@ package onebot
 import (
 	"context"
 	"crypto/subtle"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/PhantomDaze/botfabric/internal/config"
+	"github.com/PhantomDaze/botfabric/internal/wsconn"
 	"github.com/PhantomDaze/botfabric/pkg/contract"
 	"github.com/gorilla/websocket"
 )
@@ -120,6 +120,9 @@ func (p *Plugin) Stop(ctx context.Context) error {
 		for _, conn := range connections {
 			_ = conn.close(websocket.CloseNormalClosure, "shutdown")
 		}
+		for _, conn := range connections {
+			conn.ws.WaitRun()
+		}
 	})
 	return stopErr
 }
@@ -163,6 +166,7 @@ func (p *Plugin) upgradeHandler(version string) http.Handler {
 		p.connMu.Lock()
 		p.conns[conn.id] = conn
 		p.connMu.Unlock()
+		conn.ws.TrackRun()
 		go conn.run()
 	})
 }
@@ -188,15 +192,18 @@ type connection struct {
 	botID     string
 	registrar contract.EndpointRegistrar
 	createdAt time.Time
-	socket    *websocket.Conn
-	writeMu   sync.Mutex
-	closeOnce sync.Once
+	ws        *wsconn.Conn
 	echoMu    sync.Mutex
 	echoes    map[string]chan actionResponse
 }
 
 func newConnection(plugin *Plugin, version string, socket *websocket.Conn) *connection {
-	return &connection{plugin: plugin, version: version, id: fmt.Sprintf("%s-%d", version, time.Now().UnixNano()), createdAt: time.Now(), socket: socket, echoes: make(map[string]chan actionResponse)}
+	ws := wsconn.New(socket, wsconn.Options{
+		HeartbeatInterval: plugin.config.HeartbeatInterval.Duration,
+		MaxMessageSize:    int64(plugin.config.MaxMessageSize),
+		WriteTimeout:      plugin.config.WriteTimeout.Duration,
+	})
+	return &connection{plugin: plugin, version: version, id: fmt.Sprintf("%s-%d", version, time.Now().UnixNano()), createdAt: time.Now(), ws: ws, echoes: make(map[string]chan actionResponse)}
 }
 
 func (c *connection) setBotID(botID string) {
@@ -236,16 +243,13 @@ func (c *connection) run() {
 		if registrar != nil {
 			_ = registrar.UnregisterEndpoint(c.id)
 		}
-		_ = c.close(websocket.CloseNormalClosure, "closed")
+		_ = c.ws.Close(websocket.CloseNormalClosure, "closed")
+		c.ws.RunDone()
 	}()
-	c.socket.SetReadLimit(int64(c.plugin.config.MaxMessageSize))
-	_ = c.socket.SetReadDeadline(time.Now().Add(c.plugin.config.HeartbeatInterval.Duration * 2))
-	c.socket.SetPongHandler(func(string) error {
-		return c.socket.SetReadDeadline(time.Now().Add(c.plugin.config.HeartbeatInterval.Duration * 2))
-	})
-	go c.heartbeat()
+	stopKeepalive := c.ws.StartKeepalive()
+	defer stopKeepalive()
 	for {
-		_, payload, err := c.socket.ReadMessage()
+		_, payload, err := c.ws.ReadMessage()
 		if err != nil {
 			return
 		}
@@ -274,19 +278,6 @@ func (c *connection) handle(payload []byte) error {
 	return c.plugin.handleV12(c, payload)
 }
 
-func (c *connection) heartbeat() {
-	ticker := time.NewTicker(c.plugin.config.HeartbeatInterval.Duration)
-	defer ticker.Stop()
-	for range ticker.C {
-		c.writeMu.Lock()
-		err := c.socket.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second))
-		c.writeMu.Unlock()
-		if err != nil {
-			return
-		}
-	}
-}
-
 func (c *connection) registerEcho(echo string, response chan actionResponse) {
 	c.echoMu.Lock()
 	c.echoes[echo] = response
@@ -300,22 +291,9 @@ func (c *connection) unregisterEcho(echo string) {
 }
 
 func (c *connection) writeJSON(value any) error {
-	payload, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.socket.WriteMessage(websocket.TextMessage, payload)
+	return c.ws.WriteJSON(value)
 }
 
 func (c *connection) close(code int, text string) error {
-	var err error
-	c.closeOnce.Do(func() {
-		c.writeMu.Lock()
-		defer c.writeMu.Unlock()
-		_ = c.socket.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, text), time.Now().Add(time.Second))
-		err = c.socket.Close()
-	})
-	return err
+	return c.ws.Close(code, text)
 }
