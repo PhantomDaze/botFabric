@@ -381,3 +381,157 @@ func waitForConnGone(t *testing.T, adapter *Adapter, id string) {
 	}
 	t.Fatalf("连接 %s 未在超时内断开", id)
 }
+
+// deliverEvent 推送一个标准群事件到应用端，返回送达的事件 ID。
+func deliverEvent(t *testing.T, adapter *Adapter, eventID, groupID string) {
+	t.Helper()
+	payload, _ := json.Marshal(contract.GroupMessage{MessageID: "m-" + eventID, GroupID: groupID, UserID: "u", Text: "x"})
+	event := contract.Event{ID: eventID, Topic: GroupTopic, Payload: payload}
+	if err := adapter.Deliver(context.Background(), event, nil); err != nil {
+		t.Fatalf("推送事件失败: %v", err)
+	}
+}
+
+// readReply 读取服务端对一条动作帧的响应，断言其状态字段。
+func readReply(t *testing.T, socket *websocket.Conn, wantStatus string) map[string]any {
+	t.Helper()
+	_ = socket.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, payload, err := socket.ReadMessage()
+	if err != nil {
+		t.Fatalf("读取动作响应失败: %v", err)
+	}
+	var reply map[string]any
+	if err := json.Unmarshal(payload, &reply); err != nil {
+		t.Fatalf("解析动作响应失败: %v", err)
+	}
+	if reply["status"] != wantStatus {
+		t.Fatalf("期望响应状态 %s，实际 %#v", wantStatus, reply)
+	}
+	return reply
+}
+
+// TestFallbackSameGroupResolvesToRecentUndelivered 验证应用端回复缺少 __botfabric_event_id/echo 时，
+// 适配器按同群最近未决事件 fallback 关联：推送同群两个事件后，无关联回复关联到最近一个。
+func TestFallbackSameGroupResolvesToRecentUndelivered(t *testing.T) {
+	submitter := &submitter{replies: make(chan contract.CandidateReply, 2)}
+	adapter, err := New(testConfig(), endpoint.New(), submitter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Shutdown(context.Background())
+	u, _ := url.Parse("ws://" + adapter.Addr() + "/v11")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	socket, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	conn := waitConnection(t, adapter)
+	deliverEvent(t, adapter, "evt-old", "group-A")
+	deliverEvent(t, adapter, "evt-new", "group-A")
+	// 消费推送的两个事件信封，使读指针越过它们，避免与动作响应混读。
+	_ = socket.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for i := 0; i < 2; i++ {
+		if _, _, err := socket.ReadMessage(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 应用端回复不带 __botfabric_event_id/echo，仅带 group_id。
+	reply := map[string]any{"action": "send_group_msg", "params": map[string]any{"group_id": "group-A", "message": "回复"}}
+	if err := socket.WriteJSON(reply); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-submitter.replies:
+		// fallback 应关联到同群最近未决事件 evt-new。
+		if got.EventID != "evt-new" || got.GroupID != "group-A" || got.ApplicationID != conn.id || got.Text != "回复" {
+			t.Fatalf("fallback 关联错误: %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fallback 关联候选回复提交超时")
+	}
+	readReply(t, socket, "ok")
+}
+
+// TestFallbackDoesNotCrossGroups 验证 fallback 严格按群过滤：群 A、群 B 各推一事件后，
+// 群 B 缺关联回复关联到群 B 事件，而非群 A 事件。
+func TestFallbackDoesNotCrossGroups(t *testing.T) {
+	submitter := &submitter{replies: make(chan contract.CandidateReply, 2)}
+	adapter, err := New(testConfig(), endpoint.New(), submitter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Shutdown(context.Background())
+	u, _ := url.Parse("ws://" + adapter.Addr() + "/v11")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	socket, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	waitConnection(t, adapter)
+	deliverEvent(t, adapter, "evt-A", "group-A")
+	deliverEvent(t, adapter, "evt-B", "group-B")
+	// 消费推送的两个事件信封，使读指针越过它们，避免与动作响应混读。
+	_ = socket.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for i := 0; i < 2; i++ {
+		if _, _, err := socket.ReadMessage(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 群 B 缺关联回复，应关联到群 B 事件，而非更早的群 A 事件。
+	reply := map[string]any{"action": "send_group_msg", "params": map[string]any{"group_id": "group-B", "message": "回复B"}}
+	if err := socket.WriteJSON(reply); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-submitter.replies:
+		if got.EventID != "evt-B" || got.GroupID != "group-B" {
+			t.Fatalf("跨群 fallback 误关联: %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fallback 候选回复提交超时")
+	}
+}
+
+// TestFallbackNoUndeliveredReturnsError 验证无任何同群未决事件可关联时，
+// 缺关联回复返回 failed，应用端收到明确错误而非静默丢弃。
+func TestFallbackNoUndeliveredReturnsError(t *testing.T) {
+	submitter := &submitter{replies: make(chan contract.CandidateReply, 1)}
+	adapter, err := New(testConfig(), endpoint.New(), submitter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Shutdown(context.Background())
+	u, _ := url.Parse("ws://" + adapter.Addr() + "/v11")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	socket, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	waitConnection(t, adapter)
+	// 不推送任何事件，直接缺关联回复。
+	reply := map[string]any{"action": "send_group_msg", "params": map[string]any{"group_id": "group-A", "message": "回复"}}
+	if err := socket.WriteJSON(reply); err != nil {
+		t.Fatal(err)
+	}
+	readReply(t, socket, "failed")
+	select {
+	case <-submitter.replies:
+		t.Fatal("无未决事件时不应提交候选回复")
+	case <-time.After(200 * time.Millisecond):
+	}
+}

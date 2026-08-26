@@ -377,6 +377,12 @@ func validBearer(value, expected string) bool {
 	return strings.HasPrefix(value, prefix) && strings.TrimPrefix(value, prefix) == expected && expected != ""
 }
 
+// pendingEntry 记录一个待回复事件及其所属群，用于缺关联回复的同群 fallback 关联。
+type pendingEntry struct {
+	event   contract.Event
+	groupID string
+}
+
 type connection struct {
 	adapter   *Adapter
 	version   string
@@ -384,7 +390,8 @@ type connection struct {
 	ws        *wsconn.Conn
 	dead      chan struct{}
 	pendingMu sync.Mutex
-	pending   map[string]contract.Event
+	pending   map[string]pendingEntry // eventID -> entry（显式关联 O(1) 查）
+	recent    []string                // eventID 按推送顺序，仅用于 fallback 逆序取最近未决
 }
 
 func newConnection(adapter *Adapter, version string, socket *websocket.Conn) *connection {
@@ -392,7 +399,7 @@ func newConnection(adapter *Adapter, version string, socket *websocket.Conn) *co
 		HeartbeatInterval: adapter.config.HeartbeatInterval,
 		WriteTimeout:      adapter.config.WriteTimeout,
 	})
-	return &connection{adapter: adapter, version: version, id: fmt.Sprintf("%s-%d", version, time.Now().UnixNano()), ws: ws, dead: make(chan struct{}), pending: make(map[string]contract.Event)}
+	return &connection{adapter: adapter, version: version, id: fmt.Sprintf("%s-%d", version, time.Now().UnixNano()), ws: ws, dead: make(chan struct{}), pending: make(map[string]pendingEntry)}
 }
 
 func (c *connection) run() {
@@ -492,18 +499,67 @@ func (c *connection) handle(payload []byte) error {
 	if eventID == "" {
 		eventID = stringValue(envelope.Echo)
 	}
-	c.pendingMu.Lock()
-	event := c.pending[eventID]
-	delete(c.pending, eventID)
-	c.pendingMu.Unlock()
-	if eventID == "" || event.ID == "" {
-		return errors.New("应用端回复缺少有效的 event_id/echo 关联")
+	fromFallback := false
+	if eventID == "" {
+		// 缺关联信息：按同群最近未决事件 fallback 关联，使无法携带关联信息的简易应用端也能参与响应仲裁。
+		eventID = c.recentByGroup(groupID)
+		fromFallback = eventID != ""
 	}
-	result, err := c.adapter.submitter.Submit(context.Background(), contract.CandidateReply{EventID: event.ID, ApplicationID: c.id, GroupID: groupID, Text: text})
+	c.pendingMu.Lock()
+	entry, ok := c.pending[eventID]
+	if ok {
+		delete(c.pending, eventID)
+		c.removeRecent(eventID)
+	}
+	c.pendingMu.Unlock()
+	if eventID == "" || !ok || entry.event.ID == "" {
+		return errors.New("应用端回复缺少有效的 event_id/echo 关联，且无可用的最近未决事件")
+	}
+	result, err := c.adapter.submitter.Submit(context.Background(), contract.CandidateReply{EventID: entry.event.ID, ApplicationID: c.id, GroupID: groupID, Text: text})
 	if err != nil {
+		// fallback 命中但事件已被协调器过期释放：清除残留 entry，避免后续同群 fallback 反复命中陈旧事件。
+		if fromFallback {
+			var serviceErr *contract.ServiceError
+			if errors.As(err, &serviceErr) && serviceErr.Code == contract.ErrorUnavailable {
+				c.pendingMu.Lock()
+				if _, stillPending := c.pending[eventID]; stillPending {
+					delete(c.pending, eventID)
+					c.removeRecent(eventID)
+				}
+				c.pendingMu.Unlock()
+			}
+		}
 		return err
 	}
 	return c.writeJSON(map[string]any{"status": "ok", "retcode": 0, "data": result, "echo": stringValue(envelope.Echo)})
+}
+
+// recentByGroup 逆序遍历最近推送的事件，返回首个仍待回复且属于指定群的事件 ID。
+// 不命中返回空串。遍历中跳过已不在 pending 的 eventID（被显式关联消费或清理）。
+func (c *connection) recentByGroup(groupID string) string {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	for i := len(c.recent) - 1; i >= 0; i-- {
+		id := c.recent[i]
+		entry, ok := c.pending[id]
+		if !ok {
+			continue
+		}
+		if entry.groupID == groupID {
+			return id
+		}
+	}
+	return ""
+}
+
+// removeRecent 从 recent 逆序删除首个匹配的 eventID。调用方须持有 pendingMu。
+func (c *connection) removeRecent(eventID string) {
+	for i := len(c.recent) - 1; i >= 0; i-- {
+		if c.recent[i] == eventID {
+			c.recent = append(c.recent[:i], c.recent[i+1:]...)
+			return
+		}
+	}
 }
 
 // Deliver 将标准事件推送为 OneBot v11/v12 事件，并登记回复关联。
@@ -513,7 +569,8 @@ func (c *connection) Deliver(_ context.Context, event contract.Event) error {
 		return err
 	}
 	c.pendingMu.Lock()
-	c.pending[event.ID] = event
+	c.pending[event.ID] = pendingEntry{event: event, groupID: message.GroupID}
+	c.recent = append(c.recent, event.ID)
 	c.pendingMu.Unlock()
 	var envelope any
 	if c.version == VersionV11 {
