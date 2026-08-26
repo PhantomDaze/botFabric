@@ -10,4 +10,6 @@ type OneBotConfig struct {
 	ConnectTimeout    Duration `yaml:"connect_timeout"`
 	HeartbeatInterval Duration `yaml:"heartbeat_interval"`
 	MaxMessageSize    ByteSize `yaml:"max_message_size"`
+	// WriteTimeout 是数据帧写超时；0 表示不加写 deadline（保持旧行为）。
+	WriteTimeout Duration `yaml:"write_timeout"`
 }

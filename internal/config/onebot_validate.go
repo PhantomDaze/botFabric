@@ -28,5 +28,8 @@ func (c OneBotConfig) Validate() error {
 	if c.MaxMessageSize <= 0 {
 		return errors.New("onebot.max_message_size 必须大于零")
 	}
+	if c.WriteTimeout.Duration < 0 {
+		return errors.New("onebot.write_timeout 不能为负数")
+	}
 	return nil
 }

@@ -26,6 +26,7 @@ onebot:
   connect_timeout: 10s
   heartbeat_interval: 30s
   max_message_size: 4MiB
+  write_timeout: 5s # 数据帧写超时；0 表示不限
 
 application_onebot:
   enabled: false
@@ -36,9 +37,13 @@ application_onebot:
   access_token: change-me
   read_timeout: 10s
   write_timeout: 5s
+  heartbeat_interval: 30s # 0 表示不心跳（向后兼容）
   remote_address: 127.0.0.1:8092
   remote_path: /onebot
   remote_version: v11
+  reconnect_interval: 2s # 0 表示不自动重连；>0 启用指数退避
+  reconnect_max_interval: 16s
+  reconnect_max_tries: 0 # 0 表示无限重连
 
 management:
   enabled: false

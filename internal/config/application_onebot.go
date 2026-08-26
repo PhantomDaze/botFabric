@@ -4,17 +4,21 @@ import "errors"
 
 // ApplicationOneBotConfig 控制应用端 OneBot 服务端和客户端接入。
 type ApplicationOneBotConfig struct {
-	Enabled       bool     `yaml:"enabled"`
-	Mode          string   `yaml:"mode"`
-	ListenAddress string   `yaml:"listen_address"`
-	PathV11       string   `yaml:"path_v11"`
-	PathV12       string   `yaml:"path_v12"`
-	AccessToken   string   `yaml:"access_token"`
-	ReadTimeout   Duration `yaml:"read_timeout"`
-	WriteTimeout  Duration `yaml:"write_timeout"`
-	RemoteAddress string   `yaml:"remote_address"`
-	RemotePath    string   `yaml:"remote_path"`
-	RemoteVersion string   `yaml:"remote_version"`
+	Enabled              bool     `yaml:"enabled"`
+	Mode                 string   `yaml:"mode"`
+	ListenAddress        string   `yaml:"listen_address"`
+	PathV11              string   `yaml:"path_v11"`
+	PathV12              string   `yaml:"path_v12"`
+	AccessToken          string   `yaml:"access_token"`
+	ReadTimeout          Duration `yaml:"read_timeout"`
+	WriteTimeout         Duration `yaml:"write_timeout"`
+	HeartbeatInterval    Duration `yaml:"heartbeat_interval"`
+	RemoteAddress        string   `yaml:"remote_address"`
+	RemotePath           string   `yaml:"remote_path"`
+	RemoteVersion        string   `yaml:"remote_version"`
+	ReconnectInterval    Duration `yaml:"reconnect_interval"`
+	ReconnectMaxInterval Duration `yaml:"reconnect_max_interval"`
+	ReconnectMaxTries    int      `yaml:"reconnect_max_tries"`
 }
 
 // Validate 检查应用端 OneBot 配置。
@@ -46,6 +50,20 @@ func (c ApplicationOneBotConfig) Validate() error {
 	}
 	if c.ReadTimeout.Duration <= 0 || c.WriteTimeout.Duration <= 0 {
 		return errors.New("application_onebot 读写超时必须大于零")
+	}
+	// 心跳间隔：0 表示不启用心跳（向后兼容）；负数非法。
+	if c.HeartbeatInterval.Duration < 0 {
+		return errors.New("application_onebot heartbeat_interval 不能为负数")
+	}
+	// 重连配置：0 表示不自动重连（保持旧行为，首次拨号失败即返回）；>0 启用指数退避重连。
+	if c.ReconnectInterval.Duration < 0 {
+		return errors.New("application_onebot reconnect_interval 不能为负数")
+	}
+	if c.ReconnectMaxInterval.Duration < 0 {
+		return errors.New("application_onebot reconnect_max_interval 不能为负数")
+	}
+	if c.ReconnectInterval.Duration > 0 && c.ReconnectMaxInterval.Duration > 0 && c.ReconnectMaxInterval.Duration < c.ReconnectInterval.Duration {
+		return errors.New("application_onebot reconnect_max_interval 不能小于 reconnect_interval")
 	}
 	return nil
 }

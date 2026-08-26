@@ -109,17 +109,21 @@ func runWithContext(ctx context.Context, configPath string, ready func()) error 
 	var applicationOneBot *onebotapp.Adapter
 	if runtimeConfig.ApplicationOneBot.Enabled {
 		applicationOneBot, err = onebotapp.New(onebotapp.Config{
-			Enabled:       true,
-			Mode:          runtimeConfig.ApplicationOneBot.Mode,
-			ListenAddress: runtimeConfig.ApplicationOneBot.ListenAddress,
-			PathV11:       runtimeConfig.ApplicationOneBot.PathV11,
-			PathV12:       runtimeConfig.ApplicationOneBot.PathV12,
-			AccessToken:   runtimeConfig.ApplicationOneBot.AccessToken,
-			ReadTimeout:   runtimeConfig.ApplicationOneBot.ReadTimeout.Duration,
-			WriteTimeout:  runtimeConfig.ApplicationOneBot.WriteTimeout.Duration,
-			RemoteAddress: runtimeConfig.ApplicationOneBot.RemoteAddress,
-			RemotePath:    runtimeConfig.ApplicationOneBot.RemotePath,
-			RemoteVersion: runtimeConfig.ApplicationOneBot.RemoteVersion,
+			Enabled:              true,
+			Mode:                 runtimeConfig.ApplicationOneBot.Mode,
+			ListenAddress:        runtimeConfig.ApplicationOneBot.ListenAddress,
+			PathV11:              runtimeConfig.ApplicationOneBot.PathV11,
+			PathV12:              runtimeConfig.ApplicationOneBot.PathV12,
+			AccessToken:          runtimeConfig.ApplicationOneBot.AccessToken,
+			ReadTimeout:          runtimeConfig.ApplicationOneBot.ReadTimeout.Duration,
+			WriteTimeout:         runtimeConfig.ApplicationOneBot.WriteTimeout.Duration,
+			HeartbeatInterval:    runtimeConfig.ApplicationOneBot.HeartbeatInterval.Duration,
+			RemoteAddress:        runtimeConfig.ApplicationOneBot.RemoteAddress,
+			RemotePath:           runtimeConfig.ApplicationOneBot.RemotePath,
+			RemoteVersion:        runtimeConfig.ApplicationOneBot.RemoteVersion,
+			ReconnectInterval:    runtimeConfig.ApplicationOneBot.ReconnectInterval.Duration,
+			ReconnectMaxInterval: runtimeConfig.ApplicationOneBot.ReconnectMaxInterval.Duration,
+			ReconnectMaxTries:    runtimeConfig.ApplicationOneBot.ReconnectMaxTries,
 		}, manager.Endpoints(), manager.ResponseCoordinator())
 		if err != nil {
 			_ = manager.StopAll(context.Background())
