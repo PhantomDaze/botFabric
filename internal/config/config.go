@@ -77,6 +77,7 @@ type Config struct {
 	Observability     ObservabilityConfig     `yaml:"observability"`
 	OneBot            OneBotConfig            `yaml:"onebot"`
 	ApplicationOneBot ApplicationOneBotConfig `yaml:"application_onebot"`
+	Redis             RedisConfig             `yaml:"redis"`
 	Management        ManagementConfig        `yaml:"management"`
 }
 
@@ -174,6 +175,9 @@ func (c Config) Validate() error {
 		return err
 	}
 	if err := c.ApplicationOneBot.Validate(); err != nil {
+		return err
+	}
+	if err := c.Redis.Validate(); err != nil {
 		return err
 	}
 	if err := c.Management.Validate(); err != nil {

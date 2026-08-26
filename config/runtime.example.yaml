@@ -45,6 +45,13 @@ application_onebot:
   reconnect_max_interval: 16s
   reconnect_max_tries: 0 # 0 表示无限重连
 
+redis:
+  enabled: false # 关闭时去重与响应状态回退到进程内内存实现
+  address: 127.0.0.1:6379
+  password: ""
+  db: 0
+  key_prefix: "botfabric:" # 多实例共享 Redis 时的命名空间隔离
+
 management:
   enabled: false
   listen_address: 127.0.0.1:9090
