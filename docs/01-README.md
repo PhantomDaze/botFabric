@@ -38,7 +38,7 @@ BotFabric 是位于 QQ 协议端与应用端之间的**完全插件化机器人�
 - 公共消息模型与 Go SDK；
 - OneBot v11/v12 协议端反向 WebSocket；
 - 端点注册表与多协议端目标选择；
-- 可选跨协议端去重：message ID、指纹、auto，drop/forward 与内存 TTL 存储；
+- 可选跨协议端去重：message ID、指纹、auto，drop/forward，进程内存或 Redis 共享存储；
 - 路由规则：默认广播、正则过滤、selective/drop、优先级、fallback、公共 RouteClassifier 接口；
 - 响应协调器：CandidateReply、first-wins、priority-override、幂等和指定机器人回复；
 - 四个路由预设：broadcast、regex、competition、required-bot；
@@ -49,7 +49,6 @@ BotFabric 是位于 QQ 协议端与应用端之间的**完全插件化机器人�
 
 - 外部进程插件传输层仍是握手骨架，尚未实现完整 gRPC/Unix Socket 运行链路；
 - LLM 分类器目前只有公共接口和 mock 实现，不连接真实模型 API；
-- 去重与响应状态虽预留可插拔 Store，当前只提供进程内存实现；
 - Python/TypeScript SDK 和高级沙箱仍属于后续切片。
 
 ## 文档导航
