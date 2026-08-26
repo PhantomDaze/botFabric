@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/PhantomDaze/botfabric/internal/config"
+	"github.com/PhantomDaze/botfabric/internal/dedup"
 	"github.com/PhantomDaze/botfabric/internal/eventbus"
 	"github.com/PhantomDaze/botfabric/internal/gateway"
 	"github.com/PhantomDaze/botfabric/internal/management"
@@ -16,7 +17,9 @@ import (
 	"github.com/PhantomDaze/botfabric/internal/onebotapp"
 	"github.com/PhantomDaze/botfabric/internal/policy"
 	"github.com/PhantomDaze/botfabric/internal/registry"
+	"github.com/PhantomDaze/botfabric/internal/response"
 	"github.com/PhantomDaze/botfabric/internal/runtime"
+	"github.com/PhantomDaze/botfabric/internal/store"
 	"github.com/PhantomDaze/botfabric/plugins/builtin"
 )
 
@@ -73,6 +76,37 @@ func runWithContext(ctx context.Context, configPath string, ready func()) error 
 	)
 	if err != nil {
 		return err
+	}
+
+	// 分布式共享存储：启用 Redis 时去重与响应状态跨实例共享，进程死亡由 key TTL 兜底。
+	// 未启用时两个子系统各自回退到进程内内存实现，无需外部依赖。
+	var redisClient *store.Client
+	if runtimeConfig.Redis.Enabled {
+		redisClient, err = store.New(ctx, store.Config{
+			Address:   runtimeConfig.Redis.Address,
+			Password:  runtimeConfig.Redis.Password,
+			DB:        runtimeConfig.Redis.DB,
+			KeyPrefix: runtimeConfig.Redis.Prefix(),
+		})
+		if err != nil {
+			return fmt.Errorf("连接 Redis 共享存储: %w", err)
+		}
+		dedupStore, derr := dedup.NewRedisStore(redisClient)
+		if derr != nil {
+			_ = redisClient.Close()
+			return fmt.Errorf("创建 Redis 去重存储: %w", derr)
+		}
+		manager.SetDedupStore(dedupStore)
+		responseStore, rerr := response.NewRedisStore(redisClient, 0)
+		if rerr != nil {
+			_ = redisClient.Close()
+			return fmt.Errorf("创建 Redis 响应存储: %w", rerr)
+		}
+		if cerr := manager.ResponseCoordinator().SetStore(responseStore); cerr != nil {
+			_ = redisClient.Close()
+			return fmt.Errorf("注入 Redis 响应存储: %w", cerr)
+		}
+		logger.Info("已启用 Redis 共享存储", "address", runtimeConfig.Redis.Address)
 	}
 
 	loader := runtime.NewBuiltinLoader()
@@ -182,6 +216,9 @@ func runWithContext(ctx context.Context, configPath string, ready func()) error 
 	}
 	if err := manager.StopAll(shutdownCtx); err != nil {
 		return err
+	}
+	if redisClient != nil {
+		_ = redisClient.Close()
 	}
 	logger.Info("BotFabric 运行时已停止", "dead_letters", len(deadLetters.Entries()))
 	return nil

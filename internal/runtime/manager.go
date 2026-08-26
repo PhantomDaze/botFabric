@@ -30,6 +30,7 @@ type Manager struct {
 	endpoints       *endpoint.Registry
 	router          *routing.Router
 	coordinator     *response.Coordinator
+	dedupStore      dedup.Store // 共享去重存储；nil 时各插件回退到进程内内存实现
 	logger          *slog.Logger
 	botID           string
 	shutdownTimeout time.Duration
@@ -126,6 +127,15 @@ func (m *Manager) ResponseCoordinator() *response.Coordinator {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.coordinator
+}
+
+// SetDedupStore 注入共享去重存储（通常为 Redis 实现）。
+// 注入后所有启用了去重的插件复用同一存储，实现跨实例去重。
+// 应在并发使用前、插件加载前调用；传 nil 清除注入回退到内存实现。
+func (m *Manager) SetDedupStore(store dedup.Store) {
+	m.mu.Lock()
+	m.dedupStore = store
+	m.mu.Unlock()
 }
 
 // RegisterLoader 注册一种插件执行模型。
@@ -573,7 +583,12 @@ func (m *Manager) refreshDeduplicator() error {
 		if managed.manifest.Routing == nil || !managed.manifest.Routing.Dedup.Enabled {
 			continue
 		}
-		deduplicator, err := dedup.New(dedup.NewMemoryStore(), managed.manifest.Routing.Dedup)
+		// 优先使用注入的共享 store（分布式）；未注入时回退到进程内内存实现。
+		store := m.dedupStore
+		if store == nil {
+			store = dedup.NewMemoryStore()
+		}
+		deduplicator, err := dedup.New(store, managed.manifest.Routing.Dedup)
 		if err != nil {
 			return fmt.Errorf("插件 %s 的去重配置无效: %w", managed.manifest.ID, err)
 		}
