@@ -47,7 +47,7 @@ BotFabric 是位于 QQ 协议端与应用端之间的**完全插件化机器人�
 
 暂未完成或仅提供骨架：
 
-- 外部进程插件传输层仍是握手骨架，尚未实现完整 gRPC/Unix Socket 运行链路；
+- 外部进程插件传输层：Runtime 托管的 Unix Socket 双向 gRPC Session、随机会话令牌、事件/服务双向通信和子进程生命周期治理；
 - LLM 分类器目前只有公共接口和 mock 实现，不连接真实模型 API；
 - Python/TypeScript SDK 和高级沙箱仍属于后续切片。
 
