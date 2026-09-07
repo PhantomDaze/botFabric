@@ -2,6 +2,8 @@ package process
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -28,9 +30,28 @@ func (p *managedPlugin) Manifest() contract.Manifest {
 	return p.manifest
 }
 
-func (p *managedPlugin) Start(ctx context.Context, _ contract.Host) error {
-	socketPath := filepath.Join(p.socketDirectory, p.manifest.ID+".sock")
-	if err := p.transport.Start(ctx, p.manifest, socketPath); err != nil {
+func (p *managedPlugin) Start(ctx context.Context, host contract.Host) error {
+	if host != nil {
+		p.host = host
+	}
+	var session Session
+	var err error
+	sessionTransport, completeTransport := p.transport.(SessionTransport)
+	if completeTransport {
+		session, err = p.issuer.Issue(p.manifest.ID, p.sessionTTL)
+		if err != nil {
+			return p.fail("签发插件会话", err)
+		}
+		if err := validateSession(session, p.manifest.ID); err != nil {
+			return p.fail("校验插件会话", err)
+		}
+	}
+	socketPath := filepath.Join(p.socketDirectory, socketName(p.manifest.ID))
+	if completeTransport {
+		if err := sessionTransport.StartWithSession(ctx, p.manifest, socketPath, session); err != nil {
+			return p.fail("启动外部插件进程", err)
+		}
+	} else if err := p.transport.Start(ctx, p.manifest, socketPath); err != nil {
 		return p.fail("启动外部插件进程", err)
 	}
 	p.setState(HandshakeProcessStarted)
@@ -39,18 +60,33 @@ func (p *managedPlugin) Start(ctx context.Context, _ contract.Host) error {
 		return p.fail("连接外部插件 Unix Socket", err)
 	}
 	p.setState(HandshakeConnected)
-
-	session, err := p.issuer.Issue(p.manifest.ID, p.sessionTTL)
-	if err != nil {
-		_ = p.transport.Kill()
-		return p.fail("签发插件会话", err)
-	}
-	if session.PluginID != p.manifest.ID || session.Token == "" || !session.ExpiresAt.After(time.Now()) {
-		_ = p.transport.Kill()
-		return p.fail("校验插件会话", fmt.Errorf("会话内容无效"))
+	if !completeTransport {
+		session, err = p.issuer.Issue(p.manifest.ID, p.sessionTTL)
+		if err != nil {
+			_ = p.transport.Kill()
+			return p.fail("签发插件会话", err)
+		}
+		if err := validateSession(session, p.manifest.ID); err != nil {
+			_ = p.transport.Kill()
+			return p.fail("校验插件会话", err)
+		}
 	}
 	p.setState(HandshakeAuthenticated)
-	if err := p.transport.Handshake(ctx, p.manifest, session); err != nil {
+	if completeTransport {
+		callbacks := SessionCallbacks{}
+		if p.host != nil {
+			callbacks.Publish = p.host.EventBus().Publish
+			callbacks.Invoke = p.host.Gateway().Invoke
+		}
+		if err := sessionTransport.HandshakeWithCallbacks(ctx, p.manifest, session, callbacks); err != nil {
+			_ = p.transport.Kill()
+			return p.fail("完成外部插件握手", err)
+		}
+		if err := p.registerSessionResources(sessionTransport, session); err != nil {
+			_ = p.transport.Kill()
+			return p.fail("注册外部插件资源", err)
+		}
+	} else if err := p.transport.Handshake(ctx, p.manifest, session); err != nil {
 		_ = p.transport.Kill()
 		return p.fail("完成外部插件握手", err)
 	}
@@ -58,6 +94,41 @@ func (p *managedPlugin) Start(ctx context.Context, _ contract.Host) error {
 	p.session = session
 	p.state = HandshakeReady
 	p.mu.Unlock()
+	return nil
+}
+
+func socketName(pluginID string) string {
+	digest := sha256.Sum256([]byte(pluginID))
+	return "plugin-" + hex.EncodeToString(digest[:16]) + ".sock"
+}
+
+func validateSession(session Session, pluginID string) error {
+	if session.PluginID != pluginID || session.Token == "" || !session.ExpiresAt.After(time.Now()) {
+		return fmt.Errorf("会话内容无效")
+	}
+	return nil
+}
+
+func (p *managedPlugin) registerSessionResources(transport SessionTransport, session Session) error {
+	if p.host == nil {
+		return nil
+	}
+	for _, descriptor := range p.manifest.Provides.Services {
+		descriptor := descriptor
+		if err := p.host.Gateway().Register(descriptor, func(ctx context.Context, request contract.Request) (contract.Response, error) {
+			return transport.Invoke(ctx, session, request)
+		}); err != nil {
+			return err
+		}
+	}
+	for _, topic := range p.manifest.Provides.Subscriptions {
+		topic := topic
+		if _, err := p.host.EventBus().Subscribe(topic, func(ctx context.Context, event contract.Event) error {
+			return transport.Deliver(ctx, session, event)
+		}); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

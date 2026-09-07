@@ -16,10 +16,12 @@ import (
 	"github.com/PhantomDaze/botfabric/internal/observability"
 	"github.com/PhantomDaze/botfabric/internal/onebotapp"
 	"github.com/PhantomDaze/botfabric/internal/policy"
+	"github.com/PhantomDaze/botfabric/internal/process"
 	"github.com/PhantomDaze/botfabric/internal/registry"
 	"github.com/PhantomDaze/botfabric/internal/response"
 	"github.com/PhantomDaze/botfabric/internal/runtime"
 	"github.com/PhantomDaze/botfabric/internal/store"
+	"github.com/PhantomDaze/botfabric/pkg/contract"
 	"github.com/PhantomDaze/botfabric/plugins/builtin"
 )
 
@@ -119,6 +121,15 @@ func runWithContext(ctx context.Context, configPath string, ready func()) error 
 		}
 	}
 	if err := manager.RegisterLoader(loader); err != nil {
+		return err
+	}
+	processLoader, err := process.NewLoaderWithFactory(logger, runtimeConfig.Transport.UnixSocketDirectory, process.NewSessionIssuer(), func(manifest contract.Manifest) (process.Transport, error) {
+		return process.NewGRPCTransport(process.GRPCTransportConfig{Logger: logger, MaxMessageSize: int64(runtimeConfig.Transport.MaxMessageSize)})
+	})
+	if err != nil {
+		return err
+	}
+	if err := manager.RegisterLoader(processLoader); err != nil {
 		return err
 	}
 	manifests, err := runtime.DiscoverManifests(runtimeConfig.Runtime.PluginDirectory)
