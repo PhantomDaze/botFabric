@@ -2,11 +2,9 @@ package process
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -14,16 +12,16 @@ import (
 )
 
 type managedPlugin struct {
-	mu              sync.RWMutex
-	manifest        contract.Manifest
-	host            contract.Host
-	logger          *slog.Logger
-	socketDirectory string
-	issuer          SessionIssuer
-	transport       Transport
-	sessionTTL      time.Duration
-	state           HandshakeState
-	session         Session
+	mu         sync.RWMutex
+	manifest   contract.Manifest
+	host       contract.Host
+	logger     *slog.Logger
+	socketPath string
+	issuer     SessionIssuer
+	transport  Transport
+	sessionTTL time.Duration
+	state      HandshakeState
+	session    Session
 }
 
 func (p *managedPlugin) Manifest() contract.Manifest {
@@ -46,7 +44,10 @@ func (p *managedPlugin) Start(ctx context.Context, host contract.Host) error {
 			return p.fail("校验插件会话", err)
 		}
 	}
-	socketPath := filepath.Join(p.socketDirectory, socketName(p.manifest.ID))
+	socketPath := p.socketPath
+	if socketPath == "" {
+		return p.fail("生成外部插件 Unix Socket 路径", errors.New("Unix Socket 路径为空"))
+	}
 	if completeTransport {
 		if err := sessionTransport.StartWithSession(ctx, p.manifest, socketPath, session); err != nil {
 			return p.fail("启动外部插件进程", err)
@@ -95,11 +96,6 @@ func (p *managedPlugin) Start(ctx context.Context, host contract.Host) error {
 	p.state = HandshakeReady
 	p.mu.Unlock()
 	return nil
-}
-
-func socketName(pluginID string) string {
-	digest := sha256.Sum256([]byte(pluginID))
-	return "plugin-" + hex.EncodeToString(digest[:16]) + ".sock"
 }
 
 func validateSession(session Session, pluginID string) error {

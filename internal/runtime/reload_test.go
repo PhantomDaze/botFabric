@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -119,6 +121,58 @@ func TestReloadSuccessSwitchesService(t *testing.T) {
 	_ = json.Unmarshal(response.Payload, &value)
 	if value["version"] != "new" {
 		t.Fatalf("服务版本 = %q", value["version"])
+	}
+}
+
+func TestConcurrentReloadsAreSerialized(t *testing.T) {
+	manager, _ := newTestManager(t)
+	manifest := reloadManifest()
+	old := &reloadPlugin{manifest: manifest, version: "old"}
+	loader := NewBuiltinLoader()
+	if err := loader.RegisterFactory(manifest.Entry, func() contract.Plugin { return old }); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RegisterLoader(loader); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Load(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background(), manifest.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	var factoryCalls atomic.Int32
+	loader2 := NewBuiltinLoader()
+	if err := loader2.RegisterFactory(manifest.Entry, func() contract.Plugin {
+		version := factoryCalls.Add(1)
+		return &reloadPlugin{manifest: manifest, version: fmt.Sprintf("new-%d", version)}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager.loaders[contract.RuntimeInProcess] = loader2
+
+	var group sync.WaitGroup
+	errs := make(chan error, 2)
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			errs <- manager.Reload(context.Background(), manifest)
+		}()
+	}
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := factoryCalls.Load(); got != 2 {
+		t.Fatalf("重载工厂调用次数 = %d，期望 2", got)
+	}
+	if state, exists := manager.State(manifest.ID); !exists || state != contract.PluginRunning {
+		t.Fatalf("并发重载后的插件状态 = %s, exists=%v", state, exists)
 	}
 }
 

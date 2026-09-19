@@ -5,7 +5,9 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,6 +61,33 @@ func (t *fakeTransport) Shutdown(context.Context, Session) error {
 func (t *fakeTransport) Kill() error {
 	t.calls = append(t.calls, "kill")
 	return t.killErr
+}
+
+func TestLoaderCreatesUniqueSocketPathPerInstance(t *testing.T) {
+	loader, err := NewLoader(nil, t.TempDir(), fakeIssuer{session: Session{PluginID: "process.example", Token: "token", ExpiresAt: time.Now().Add(time.Minute)}}, &fakeTransport{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	first, err := loader.Load(manifest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := loader.Load(manifest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPlugin := first.(*managedPlugin)
+	secondPlugin := second.(*managedPlugin)
+	if firstPlugin.socketPath == secondPlugin.socketPath {
+		t.Fatalf("两个插件实例共享 Socket 路径: %q", firstPlugin.socketPath)
+	}
+	if filepath.Dir(firstPlugin.socketPath) != filepath.Dir(secondPlugin.socketPath) {
+		t.Fatal("插件实例 Socket 未使用配置目录")
+	}
+	if !strings.HasPrefix(filepath.Base(firstPlugin.socketPath), "plugin-") || !strings.HasSuffix(firstPlugin.socketPath, ".sock") {
+		t.Fatalf("Socket 路径格式异常: %q", firstPlugin.socketPath)
+	}
 }
 
 func TestLoaderRequiresImplementedBoundary(t *testing.T) {

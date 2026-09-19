@@ -2,9 +2,13 @@ package process
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -139,14 +143,31 @@ func (l *Loader) Load(manifest contract.Manifest, host contract.Host) (contract.
 			return nil, errors.New("transport factory 返回 nil")
 		}
 	}
+	socketPath, err := newSocketPath(l.socketDirectory, manifest.ID)
+	if err != nil {
+		return nil, fmt.Errorf("生成插件 %s 的 Unix Socket 路径: %w", manifest.ID, err)
+	}
 	return &managedPlugin{
-		manifest:        manifest,
-		host:            host,
-		logger:          l.logger.With("plugin_id", manifest.ID),
-		socketDirectory: l.socketDirectory,
-		issuer:          l.issuer,
-		transport:       transport,
-		sessionTTL:      l.sessionTTL,
-		state:           HandshakeCreated,
+		manifest:   manifest,
+		host:       host,
+		logger:     l.logger.With("plugin_id", manifest.ID),
+		socketPath: socketPath,
+		issuer:     l.issuer,
+		transport:  transport,
+		sessionTTL: l.sessionTTL,
+		state:      HandshakeCreated,
 	}, nil
+}
+
+func newSocketPath(directory, pluginID string) (string, error) {
+	if directory == "" || pluginID == "" {
+		return "", errors.New("Unix Socket 目录和插件 ID 不能为空")
+	}
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return "", fmt.Errorf("生成 Unix Socket 实例标识: %w", err)
+	}
+	digest := sha256.Sum256([]byte(pluginID))
+	name := "plugin-" + hex.EncodeToString(digest[:8]) + "-" + hex.EncodeToString(suffix[:]) + ".sock"
+	return filepath.Join(directory, name), nil
 }

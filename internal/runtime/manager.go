@@ -24,6 +24,7 @@ import (
 // Manager 负责插件发现后的装载、启停、回滚和健康检查。
 type Manager struct {
 	mu              sync.Mutex
+	reloadMu        sync.Mutex
 	registry        *registry.Registry
 	eventBus        *eventbus.Bus
 	gateway         *gateway.Gateway
@@ -405,6 +406,8 @@ func (m *Manager) runningDependent(providerID string) string {
 
 // Reload 用新实例成功启动后替换旧插件；新实例失败时旧实例保持运行。
 func (m *Manager) Reload(ctx context.Context, manifest contract.Manifest) error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
 	if err := config.ValidateManifest(manifest); err != nil {
 		return err
 	}
