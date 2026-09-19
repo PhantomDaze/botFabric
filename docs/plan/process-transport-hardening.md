@@ -15,7 +15,7 @@
 
 ## 已完成
 
-- `internal/process/plugin.go` 使用 SHA-256 截断摘要生成稳定 Socket 文件名：`plugin-<32 hex>.sock`。
+- `internal/process/loader.go` 使用 SHA-256 摘要生成安全的 Socket 文件名前缀，并在每次 `Loader.Load` 时追加随机实例后缀，最终形如 `plugin-<16 hex>-<16 hex>.sock`；不再让同一 Manifest 的 staging/旧实例共享 Socket 路径。
 - `internal/process/grpc_transport.go` 增加启动互斥锁。
 - 启动早期失败路径关闭 `processDone`，避免 Connect/Handshake 等待永久阻塞。
 - gRPC 握手失败继续设置错误、断开 Session、终止外部进程并清理 Socket。
