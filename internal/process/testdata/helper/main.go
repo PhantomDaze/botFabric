@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -67,6 +68,10 @@ type sessionClient struct {
 func main() {
 	if os.Getenv("BOTFABRIC_HELPER_CHILD") == "1" {
 		childMode()
+		return
+	}
+	if os.Getenv("BOTFABRIC_HELPER_ALLOC_PROBE") == "1" {
+		allocProbe()
 		return
 	}
 	if err := run(); err != nil {
@@ -211,6 +216,26 @@ func forkLongRunningChild() error {
 // 通过 BOTFABRIC_HELPER_CHILD 环境变量区分，不再连接 Runtime。
 func childMode() {
 	fmt.Println(os.Getpid())
+	select {}
+}
+
+// allocProbe 是被 fork 的探测子进程入口：申请并逐页触碰 limit 指向的
+// 大内存后驻留，用于验证 RSS 内存监控是否生效。
+func allocProbe() {
+	limit := os.Getenv("BOTFABRIC_HELPER_ALLOC_BYTES")
+	bytes, err := strconv.ParseInt(limit, 10, 64)
+	if err != nil || bytes <= 0 {
+		fmt.Fprintln(os.Stderr, "alloc probe: 缺少 BOTFABRIC_HELPER_ALLOC_BYTES")
+		os.Exit(2)
+	}
+	// 先报告自己 PID，供测试探测进程是否存活。
+	fmt.Fprintln(os.Stderr, "alloc probe pid: ", os.Getpid())
+	// 逐页触碰让内核真正分配物理页；未触碰的匿名内存不计入 RSS。
+	buffer := make([]byte, bytes)
+	for offset := int64(0); offset < bytes; offset += 4096 {
+		buffer[offset] = 1
+	}
+	fmt.Fprintln(os.Stderr, "alloc probe: succeeded")
 	select {}
 }
 

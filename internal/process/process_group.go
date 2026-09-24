@@ -2,7 +2,10 @@ package process
 
 import (
 	"errors"
+	"log/slog"
 	"os/exec"
+	"sync"
+	"time"
 )
 
 // sigForceKill 是强制终止进程组时使用的信号；由平台文件定义。
@@ -26,3 +29,54 @@ func terminateProcessGroup(pgid int, signal osSignal) error {
 	}
 	return signalProcessGroup(pgid, signal)
 }
+
+// applyMemoryLimit 为外部插件进程设置内存上限。
+//
+// 实现为 RSS 轮询监控：bytes 为 0 表示清单未声明，跳过监控。
+// 通过 monitor 返回的停止函数结束监控 goroutine。
+func applyMemoryLimit(command *exec.Cmd, bytes int64, logger *slog.Logger, pluginID string, onExceeded func()) (stop func()) {
+	if bytes <= 0 || command == nil || command.Process == nil {
+		return func() {}
+	}
+	pid := command.Process.Pid
+	done := make(chan struct{})
+	once := sync.OnceFunc(func() { close(done) })
+	go func() {
+		// 连续超限次数：瞬时峰值不立即杀，持续超限才终止。
+		overLimit := 0
+		ticker := time.NewTicker(memorySampleInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+			}
+			rss, err := readProcessRSS(pid)
+			if err != nil {
+				// 进程退出后 /proc 读取失败，监控自然结束。
+				return
+			}
+			if rss > bytes {
+				overLimit++
+				if overLimit >= memoryOverLimitSamples {
+					logger.Error("外部插件内存超限，强制终止", "plugin_id", pluginID, "rss_bytes", rss, "limit_bytes", bytes)
+					if onExceeded != nil {
+						onExceeded()
+					}
+					return
+				}
+			} else {
+				overLimit = 0
+			}
+		}
+	}()
+	return once
+}
+
+const (
+	// memorySampleInterval 是 RSS 采样周期。
+	memorySampleInterval = 200 * time.Millisecond
+	// memoryOverLimitSamples 是连续超限采样次数阈值。
+	memoryOverLimitSamples = 5
+)

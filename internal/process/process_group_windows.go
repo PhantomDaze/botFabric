@@ -25,3 +25,8 @@ func signalProcessGroup(int, osSignal) error {
 
 // processGroupID 在 Windows 平台恒返回 0。
 func processGroupID(*os.Process) int { return 0 }
+
+// readProcessRSS 在 Windows 平台不可用；返回错误使监控 goroutine 退出。
+func readProcessRSS(int) (int64, error) {
+	return 0, errors.New("Windows 平台不支持 RSS 读取")
+}

@@ -293,7 +293,65 @@ func TestGRPCTransportKillsBlockedProcess(t *testing.T) {
 	}
 }
 
-// processAlive 判断进程是否仍在运行（0 信号探测）。
+// TestGRPCTransportEnforcesMemoryLimit 验证 Manifest Limits.Memory 通过
+// RSS 监控真正作用于外部进程：持续 RSS 超限时进程被强制终止，
+// 而正常握手与调用不受影响。
+func TestGRPCTransportEnforcesMemoryLimit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 不支持 /proc RSS 读取")
+	}
+	helper := buildProcessHelper(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	transport, err := NewGRPCTransport(GRPCTransportConfig{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	manifest.Entry = helper
+	// 64MiB 远小于 probe 分配的 512MiB，触发持续超限。
+	manifest.Limits.Memory = "64MiB"
+	// probe 模式下 helper 不连接 Runtime，直接尝试大内存分配并驻留。
+	t.Setenv("BOTFABRIC_HELPER_ALLOC_PROBE", "1")
+	t.Setenv("BOTFABRIC_HELPER_ALLOC_BYTES", "536870912")
+
+	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
+	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Kill()
+
+	// RSS 监控在连续超限采样后终止进程；上限约 5 次采样周期加进程退出时间。
+	select {
+	case <-transport.processDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("持续内存超限的进程未被终止")
+	}
+	if _, err := os.Stat(socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("超限终止后 Unix Socket 仍存在: %v", err)
+	}
+
+	// 交叉验证：同 helper 不设 probe、正常运行时握手不受 64MiB 限制影响。
+	transport2, err := NewGRPCTransport(GRPCTransportConfig{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport2.Kill()
+	os.Unsetenv("BOTFABRIC_HELPER_ALLOC_PROBE")
+	os.Unsetenv("BOTFABRIC_HELPER_ALLOC_BYTES")
+	socketPath2 := filepath.Join(t.TempDir(), "plugin.sock")
+	if err := transport2.StartWithSession(context.Background(), manifest, socketPath2, session); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := transport2.Connect(ctx, socketPath2); err != nil {
+		t.Fatalf("64MiB 限制不应阻断正常握手: %v", err)
+	}
+	if err := transport2.HandshakeWithCallbacks(ctx, manifest, session, SessionCallbacks{}); err != nil {
+		t.Fatalf("64MiB 限制不应阻断正常握手: %v", err)
+	}
+}
 func processAlive(pid int) bool {
 	proc, err := os.FindProcess(pid)
 	if err != nil {
@@ -376,6 +434,11 @@ func TestGRPCTransportKillsProcessGroup(t *testing.T) {
 	}
 	if childPID == 0 {
 		t.Fatalf("未能从 helper 日志解析子进程 PID:\n%s", content)
+	}
+	// SIGKILL 送达后子进程从内核消失需要短暂时间，轮询等待而不是立即判定。
+	deadline := time.Now().Add(2 * time.Second)
+	for processAlive(childPID) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
 	}
 	if processAlive(childPID) {
 		t.Fatalf("Kill 后子孙进程 %d 仍在运行", childPID)

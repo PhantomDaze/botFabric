@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,9 +39,7 @@ type GRPCTransportConfig struct {
 	Logger         *slog.Logger
 	MaxMessageSize int64
 	MaxInFlight    int
-}
-
-// GRPCTransport 是 Runtime-owned Unix Socket 上的双向 gRPC transport。
+} // GRPCTransport 是 Runtime-owned Unix Socket 上的双向 gRPC transport。
 // 每个实例只托管一个外部插件进程和一条 Session，避免不同插件共享状态。
 type GRPCTransport struct {
 	botfabricv1.UnimplementedProcessPluginServer
@@ -84,6 +84,7 @@ type GRPCTransport struct {
 	pendingMu         sync.Mutex
 	pending           map[string]chan wireFrame
 	inFlight          chan struct{}
+	stopMemoryMonitor func()
 }
 
 // NewGRPCTransport 创建一个外部插件 gRPC transport。
@@ -210,6 +211,13 @@ func (t *GRPCTransport) start(ctx context.Context, manifest contract.Manifest, s
 	t.mu.Lock()
 	t.process = command
 	t.processGroupID = processGroupID(command.Process)
+	t.mu.Unlock()
+	// 内存监控：持续 RSS 超过清单上限时终止进程并断开 Session。
+	// 监控随 transport 生命周期存续，在 cleanup 中停止。
+	t.mu.Lock()
+	t.stopMemoryMonitor = applyMemoryLimit(command, memoryLimitBytes(manifest), t.config.Logger, manifest.ID, func() {
+		_ = t.Kill()
+	})
 	t.mu.Unlock()
 	go t.waitProcess(command)
 	go func() {
@@ -675,12 +683,17 @@ func (t *GRPCTransport) cleanup() error {
 		socketInfo := t.socketInfo
 		cancel := t.sessionCancel
 		stream := t.stream
+		stopMemoryMonitor := t.stopMemoryMonitor
 		t.server = nil
 		t.listener = nil
+		t.stopMemoryMonitor = nil
 		t.inboundMu.Lock()
 		t.inboundClosing = true
 		t.inboundMu.Unlock()
 		t.mu.Unlock()
+		if stopMemoryMonitor != nil {
+			stopMemoryMonitor()
+		}
 		if cancel != nil {
 			cancel()
 		}
@@ -1113,4 +1126,35 @@ func cloneStringMap(values map[string]string) map[string]string {
 		result[key] = value
 	}
 	return result
+}
+
+// memoryLimitBytes 把清单 Memory 字段（如 128MiB）解析为字节数。
+// 未声明或无法解析时返回 0，交由平台层跳过限制。
+func memoryLimitBytes(manifest contract.Manifest) int64 {
+	if manifest.Limits.Memory == "" {
+		return 0
+	}
+	units := []struct {
+		suffix string
+		factor int64
+	}{
+		{"GiB", 1024 * 1024 * 1024},
+		{"MiB", 1024 * 1024},
+		{"KiB", 1024},
+		{"B", 1},
+	}
+	for _, unit := range units {
+		if strings.HasSuffix(manifest.Limits.Memory, unit.suffix) {
+			number := strings.TrimSpace(strings.TrimSuffix(manifest.Limits.Memory, unit.suffix))
+			value, err := strconv.ParseInt(number, 10, 64)
+			if err != nil || value < 0 {
+				return 0
+			}
+			if value > (1<<63-1)/unit.factor {
+				return 0
+			}
+			return value * unit.factor
+		}
+	}
+	return 0
 }

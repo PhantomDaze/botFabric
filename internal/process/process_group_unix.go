@@ -55,3 +55,30 @@ func processGroupID(process *os.Process) int {
 	}
 	return 0
 }
+
+// setMemoryLimit 在 Unix 平台读取进程当前 RSS 字节数。
+//
+// 注意不使用 RLIMIT_AS：Go/JVM 等运行时保留远超物理内存的虚拟
+// 地址空间，RLIMIT_AS 会直接压死进程初始化。改为由 transport 轮询
+// RSS 并在超限时终止进程。
+func readProcessRSS(pid int) (int64, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "VmRSS:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			break
+		}
+		kib, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("解析 VmRSS: %w", err)
+		}
+		return kib * 1024, nil
+	}
+	return 0, errors.New("未找到 VmRSS 字段")
+}
