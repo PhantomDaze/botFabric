@@ -9,7 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -288,5 +290,97 @@ func TestGRPCTransportKillsBlockedProcess(t *testing.T) {
 	_, err = transport.Invoke(invokeCtx, session, contract.Request{Service: "process.remote", Method: "Run"})
 	if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
 		t.Fatalf("阻塞调用错误 = %v，期望 context deadline exceeded", err)
+	}
+}
+
+// processAlive 判断进程是否仍在运行（0 信号探测）。
+func processAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+func TestGRPCTransportKillsProcessGroup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 不支持 POSIX 进程组")
+	}
+	helper := buildProcessHelper(t)
+	// childLog 捕获 helper stderr 中的子进程 PID 行。
+	childLog, err := os.CreateTemp(t.TempDir(), "helper-child-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(childLog, nil))
+	transport, err := NewGRPCTransport(GRPCTransportConfig{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	manifest.Entry = helper
+	t.Setenv("BOTFABRIC_HELPER_FORK_CHILD", "1")
+	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
+	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := transport.Connect(ctx, socketPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := transport.HandshakeWithCallbacks(ctx, manifest, session, SessionCallbacks{}); err != nil {
+		t.Fatal(err)
+	}
+
+	transport.mu.RLock()
+	pgid := transport.processGroupID
+	transport.mu.RUnlock()
+	if pgid == 0 {
+		t.Fatal("外部插件进程组未建立")
+	}
+
+	if err := transport.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-transport.processDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("helper 进程未退出")
+	}
+
+	// 子进程 PID 从 helper 的 stderr 日志解析。
+	if err := childLog.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(childLog.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var childPID int
+	for _, line := range strings.Split(string(content), "\n") {
+		// slog 文本格式把 helper stderr 行包进 message="..."，先剥壳再匹配前缀。
+		if idx := strings.Index(line, `message="`); idx >= 0 {
+			if end := strings.Index(line[idx+9:], `"`); end >= 0 {
+				line = line[idx+9 : idx+9+end]
+			}
+		}
+		line = strings.TrimSuffix(line, `\n`)
+		if prefix := "helper child pid: "; strings.HasPrefix(line, prefix) {
+			value, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, prefix)))
+			if err == nil {
+				childPID = value
+			}
+		}
+	}
+	if childPID == 0 {
+		t.Fatalf("未能从 helper 日志解析子进程 PID:\n%s", content)
+	}
+	if processAlive(childPID) {
+		t.Fatalf("Kill 后子孙进程 %d 仍在运行", childPID)
+	}
+	if _, err := os.Stat(socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Kill 后 Unix Socket 仍存在: %v", err)
 	}
 }

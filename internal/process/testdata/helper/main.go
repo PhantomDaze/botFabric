@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,6 +65,10 @@ type sessionClient struct {
 }
 
 func main() {
+	if os.Getenv("BOTFABRIC_HELPER_CHILD") == "1" {
+		childMode()
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -79,6 +86,11 @@ func run() error {
 	}
 	if os.Getenv("BOTFABRIC_HELPER_BAD_TOKEN") == "1" {
 		token = "invalid-token"
+	}
+	if os.Getenv("BOTFABRIC_HELPER_FORK_CHILD") == "1" {
+		if err := forkLongRunningChild(); err != nil {
+			return fmt.Errorf("fork 长驻子进程: %w", err)
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -171,6 +183,35 @@ func run() error {
 			return fmt.Errorf("helper 收到未知帧类型: %s", incoming.Type)
 		}
 	}
+}
+
+// forkLongRunningChild fork 出一个长驻子进程，用于验证 Runtime 终止
+// 进程组时能回收子孙进程。子进程向 stdout 输出自己的 PID 后阻塞等待。
+func forkLongRunningChild() error {
+	command := exec.Command(os.Args[0])
+	command.Env = append(os.Environ(), "BOTFABRIC_HELPER_CHILD=1")
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := command.Start(); err != nil {
+		return err
+	}
+	// 子进程输出 PID 后长驻，不能用 ReadAll 等 EOF；按行读一次即返回。
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		return err
+	}
+	childPID := strings.TrimSpace(line)
+	fmt.Fprintf(os.Stderr, "helper child pid: %s\n", childPID)
+	return nil
+}
+
+// childMode 是被 fork 的子进程入口：输出自身 PID 后长驻。
+// 通过 BOTFABRIC_HELPER_CHILD 环境变量区分，不再连接 Runtime。
+func childMode() {
+	fmt.Println(os.Getpid())
+	select {}
 }
 
 func (s *sessionClient) sendHostCalls() {

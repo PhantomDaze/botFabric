@@ -54,6 +54,7 @@ type GRPCTransport struct {
 	listener          net.Listener
 	server            *grpc.Server
 	process           *exec.Cmd
+	processGroupID    int
 	processDone       chan struct{}
 	processDoneOnce   sync.Once
 	processErr        error
@@ -184,6 +185,7 @@ func (t *GRPCTransport) start(ctx context.Context, manifest contract.Manifest, s
 	server.RegisterService(&botfabricv1.ProcessPlugin_ServiceDesc, &grpcService{transport: t})
 
 	command := exec.Command(manifest.Entry)
+	prepareProcessGroup(command)
 	command.Env = append(os.Environ(),
 		"BOTFABRIC_SOCKET="+socketPath,
 		"BOTFABRIC_PLUGIN_ID="+manifest.ID,
@@ -207,6 +209,7 @@ func (t *GRPCTransport) start(ctx context.Context, manifest contract.Manifest, s
 	}
 	t.mu.Lock()
 	t.process = command
+	t.processGroupID = processGroupID(command.Process)
 	t.mu.Unlock()
 	go t.waitProcess(command)
 	go func() {
@@ -391,9 +394,17 @@ func (t *GRPCTransport) Kill() error {
 func (t *GRPCTransport) killProcess() error {
 	t.mu.RLock()
 	command := t.process
+	pgid := t.processGroupID
 	t.mu.RUnlock()
 	if command == nil || command.Process == nil {
 		return nil
+	}
+	// 优先向整个进程组发信号，回收 fork 出的子孙进程；
+	// 进程组不可用时退回为只终止直接子进程。
+	if pgid != 0 {
+		if err := terminateProcessGroup(pgid, sigForceKill); err != nil {
+			return err
+		}
 	}
 	if err := command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return err
