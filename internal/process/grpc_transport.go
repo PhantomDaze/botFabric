@@ -84,7 +84,7 @@ type GRPCTransport struct {
 	pendingMu         sync.Mutex
 	pending           map[string]chan wireFrame
 	inFlight          chan struct{}
-	stopMemoryMonitor func()
+	memoryEnforcer    *memoryEnforcer
 }
 
 // NewGRPCTransport 创建一个外部插件 gRPC transport。
@@ -203,21 +203,27 @@ func (t *GRPCTransport) start(ctx context.Context, manifest contract.Manifest, s
 		t.closeProcessDone()
 		return err
 	}
-	if err := command.Start(); err != nil {
-		_ = t.cleanup()
-		t.closeProcessDone()
-		return fmt.Errorf("启动外部插件进程: %w", err)
+	// 内存限制优先走 cgroup v2 memory.max：由它启动并托管进程（内核 OOM，
+	// 覆盖整棵进程树）。不可用时回退为直接 exec，再用 RSS 轮询兜底（只覆盖直接子进程）。
+	limit := memoryLimitBytes(manifest)
+	enforcer := startCgroupMemoryLimit(command, limit, t.config.Logger, manifest.ID)
+	if enforcer == nil {
+		if err := command.Start(); err != nil {
+			_ = t.cleanup()
+			t.closeProcessDone()
+			return fmt.Errorf("启动外部插件进程: %w", err)
+		}
+		if limit > 0 {
+			t.config.Logger.Warn("cgroup v2 内存限制不可用，回退 RSS 轮询监控", "plugin_id", manifest.ID)
+			enforcer = &memoryEnforcer{stop: startRSSMemoryMonitor(command, limit, t.config.Logger, manifest.ID, func() {
+				_ = t.Kill()
+			})}
+		}
 	}
 	t.mu.Lock()
 	t.process = command
 	t.processGroupID = processGroupID(command.Process)
-	t.mu.Unlock()
-	// 内存监控：持续 RSS 超过清单上限时终止进程并断开 Session。
-	// 监控随 transport 生命周期存续，在 cleanup 中停止。
-	t.mu.Lock()
-	t.stopMemoryMonitor = applyMemoryLimit(command, memoryLimitBytes(manifest), t.config.Logger, manifest.ID, func() {
-		_ = t.Kill()
-	})
+	t.memoryEnforcer = enforcer
 	t.mu.Unlock()
 	go t.waitProcess(command)
 	go func() {
@@ -403,9 +409,15 @@ func (t *GRPCTransport) killProcess() error {
 	t.mu.RLock()
 	command := t.process
 	pgid := t.processGroupID
+	enforcer := t.memoryEnforcer
 	t.mu.RUnlock()
 	if command == nil || command.Process == nil {
 		return nil
+	}
+	// cgroup 路径下 systemd 以 KillMode=control-group 管理整棵进程树；
+	// 直接向进程组发信号会在 systemctl stop 前制造预期的 ESRCH。
+	if enforcer != nil && enforcer.reaper != nil {
+		return enforcer.reaper()
 	}
 	// 优先向整个进程组发信号，回收 fork 出的子孙进程；
 	// 进程组不可用时退回为只终止直接子进程。
@@ -447,7 +459,10 @@ func (t *GRPCTransport) closeProcessDone() {
 }
 
 func (t *GRPCTransport) waitProcess(command *exec.Cmd) {
-	err := command.Wait()
+	t.mu.RLock()
+	managed := t.memoryEnforcer != nil && t.memoryEnforcer.managed
+	t.mu.RUnlock()
+	err := waitPluginProcess(command, managed)
 	t.mu.Lock()
 	t.processErr = err
 	shutdown := t.shutdownRequested
@@ -458,6 +473,18 @@ func (t *GRPCTransport) waitProcess(command *exec.Cmd) {
 	if err != nil && !shutdown {
 		t.config.Logger.Warn("外部插件进程退出", "plugin_id", t.manifest.ID, "error", err)
 	}
+}
+
+// waitPluginProcess 等待插件进程退出并返回其退出错误。
+//
+// 直接 exec 启动的进程走 exec.Cmd.Wait，能正确释放资源并报告退出状态。
+// cgroup 路径下进程由 systemd transient service 启动，不是 Runtime 的
+// 子进程，os.Process.Wait 只会返回 ECHILD；改用轮询探测 PID 消失。
+func waitPluginProcess(command *exec.Cmd, managed bool) error {
+	if managed {
+		return waitManagedProcess(command)
+	}
+	return command.Wait()
 }
 
 func processExitError(err error) error {
@@ -683,16 +710,16 @@ func (t *GRPCTransport) cleanup() error {
 		socketInfo := t.socketInfo
 		cancel := t.sessionCancel
 		stream := t.stream
-		stopMemoryMonitor := t.stopMemoryMonitor
+		enforcer := t.memoryEnforcer
 		t.server = nil
 		t.listener = nil
-		t.stopMemoryMonitor = nil
+		t.memoryEnforcer = nil
 		t.inboundMu.Lock()
 		t.inboundClosing = true
 		t.inboundMu.Unlock()
 		t.mu.Unlock()
-		if stopMemoryMonitor != nil {
-			stopMemoryMonitor()
+		if enforcer != nil && enforcer.stop != nil {
+			enforcer.stop()
 		}
 		if cancel != nil {
 			cancel()

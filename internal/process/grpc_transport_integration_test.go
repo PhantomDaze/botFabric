@@ -352,6 +352,104 @@ func TestGRPCTransportEnforcesMemoryLimit(t *testing.T) {
 		t.Fatalf("64MiB 限制不应阻断正常握手: %v", err)
 	}
 }
+
+// TestGRPCTransportCgroupCoversDescendants 验证 cgroup 路径下内存上限对
+// 孙进程同样生效：helper fork 出触碰大内存的子进程，内核 OOM 在 cgroup
+// 限额内回收它，Runtime 不需要主动杀。
+func TestGRPCTransportCgroupCoversDescendants(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("cgroup v2 内存限制仅在 Linux 可用")
+	}
+	helper := buildProcessHelper(t)
+	childLog, err := os.CreateTemp(t.TempDir(), "helper-alloc-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(childLog, nil))
+	transport, err := NewGRPCTransport(GRPCTransportConfig{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	manifest.Entry = helper
+	manifest.Limits.Memory = "64MiB"
+	startFile := filepath.Join(t.TempDir(), "start-allocation")
+	t.Setenv("BOTFABRIC_HELPER_FORK_ALLOC", "1")
+	t.Setenv("BOTFABRIC_HELPER_FORK_ALLOC_BYTES", "536870912")
+	t.Setenv("BOTFABRIC_HELPER_ALLOC_START_FILE", startFile)
+
+	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
+	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Kill()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := transport.Connect(ctx, socketPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := transport.HandshakeWithCallbacks(ctx, manifest, session, SessionCallbacks{}); err != nil {
+		t.Fatal(err)
+	}
+	transport.mu.RLock()
+	managed := transport.memoryEnforcer != nil && transport.memoryEnforcer.managed
+	transport.mu.RUnlock()
+	if !managed {
+		_ = transport.Kill()
+		t.Skip("systemd user service 或 cgroup v2 memory controller 不可用")
+	}
+
+	// 等待子进程报告 PID 后再开始分配，避免降级环境误触发 RSS 监控。
+	var allocChild int
+	var content []byte
+	pidDeadline := time.Now().Add(3 * time.Second)
+	for allocChild == 0 && time.Now().Before(pidDeadline) {
+		if err := childLog.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		content, err := os.ReadFile(childLog.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(string(content), "\n") {
+			if idx := strings.Index(line, `message="`); idx >= 0 {
+				if end := strings.Index(line[idx+9:], `"`); end >= 0 {
+					line = line[idx+9 : idx+9+end]
+				}
+			}
+			line = strings.TrimSuffix(line, `\n`)
+			if prefix := "alloc child pid: "; strings.HasPrefix(line, prefix) {
+				allocChild, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, prefix)))
+			}
+		}
+		if allocChild == 0 {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if allocChild == 0 {
+		t.Fatalf("未能解析孙进程 PID:\n%s", content)
+	}
+	if err := os.WriteFile(startFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 主进程存活（内存由孙进程占用，cgroup 内核 OOM 应只杀孙进程）。
+	select {
+	case <-transport.processDone:
+		t.Fatal("cgroup OOM 不应误杀内存占用正常的 helper 主进程")
+	case <-time.After(3 * time.Second):
+	}
+
+	// 确认内核已回收超过 cgroup 限额的孙进程。
+	deadline := time.Now().Add(5 * time.Second)
+	for processAlive(allocChild) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if processAlive(allocChild) {
+		t.Fatalf("触碰 512MiB 的孙进程 %d 未被 cgroup 内存上限回收", allocChild)
+	}
+}
 func processAlive(pid int) bool {
 	proc, err := os.FindProcess(pid)
 	if err != nil {
@@ -408,7 +506,7 @@ func TestGRPCTransportKillsProcessGroup(t *testing.T) {
 		t.Fatal("helper 进程未退出")
 	}
 
-	// 子进程 PID 从 helper 的 stderr 日志解析。
+	// 子进程 PID 从 helper 的 stderr 日志解析；cleanup 会等待文件 tail 扫尾完成。
 	if err := childLog.Sync(); err != nil {
 		t.Fatal(err)
 	}

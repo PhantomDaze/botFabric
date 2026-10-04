@@ -30,11 +30,22 @@ func terminateProcessGroup(pgid int, signal osSignal) error {
 	return signalProcessGroup(pgid, signal)
 }
 
-// applyMemoryLimit 为外部插件进程设置内存上限。
+// memoryEnforcer 是一个已生效的内存限制手段。
 //
-// 实现为 RSS 轮询监控：bytes 为 0 表示清单未声明，跳过监控。
-// 通过 monitor 返回的停止函数结束监控 goroutine。
-func applyMemoryLimit(command *exec.Cmd, bytes int64, logger *slog.Logger, pluginID string, onExceeded func()) (stop func()) {
+// stop 在 transport 清理时调用：停止监控 goroutine，或移除为插件建立的 cgroup。
+// reaper 非 nil 时，表示插件主进程由该手段托管（如 transient service），
+// 需要由它在 Shutdown/Kill 时终止主进程；nil 表示仍由 exec.Cmd 直接管理。
+type memoryEnforcer struct {
+	stop    func()
+	reaper  func() error
+	managed bool
+}
+
+// startRSSMemoryMonitor 以轮询 RSS 的方式兜底限制内存，返回停止函数。
+//
+// 只统计直接子进程，不计入其 fork 出的子孙进程。瞬时峰值不触发，
+// 连续多次采样超限才调用 onExceeded 终止，避免误伤正常插件。
+func startRSSMemoryMonitor(command *exec.Cmd, bytes int64, logger *slog.Logger, pluginID string, onExceeded func()) func() {
 	if bytes <= 0 || command == nil || command.Process == nil {
 		return func() {}
 	}

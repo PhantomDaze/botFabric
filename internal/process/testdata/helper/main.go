@@ -74,6 +74,11 @@ func main() {
 		allocProbe()
 		return
 	}
+	if os.Getenv("BOTFABRIC_HELPER_FORK_ALLOC") == "1" {
+		// fork 一个 probe 子进程后主进程继续正常握手；
+		// 用于验证 cgroup 内存上限对孙进程同样生效。
+		forkAllocProbe()
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -219,6 +224,24 @@ func childMode() {
 	select {}
 }
 
+// forkAllocProbe fork 一个执行 allocProbe 的子进程，主进程继续正常流程。
+// 子进程的 PID 写到 stderr 供测试解析。
+func forkAllocProbe() {
+	command := exec.Command(os.Args[0])
+	command.Env = append(os.Environ(),
+		"BOTFABRIC_HELPER_ALLOC_PROBE=1",
+		"BOTFABRIC_HELPER_ALLOC_BYTES="+os.Getenv("BOTFABRIC_HELPER_FORK_ALLOC_BYTES"),
+	)
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	if err := command.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "fork alloc probe 失败: %v\n", err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "alloc child pid: %d\n", command.Process.Pid)
+	go func() { _ = command.Wait() }()
+}
+
 // allocProbe 是被 fork 的探测子进程入口：申请并逐页触碰 limit 指向的
 // 大内存后驻留，用于验证 RSS 内存监控是否生效。
 func allocProbe() {
@@ -228,8 +251,15 @@ func allocProbe() {
 		fmt.Fprintln(os.Stderr, "alloc probe: 缺少 BOTFABRIC_HELPER_ALLOC_BYTES")
 		os.Exit(2)
 	}
-	// 先报告自己 PID，供测试探测进程是否存活。
 	fmt.Fprintln(os.Stderr, "alloc probe pid: ", os.Getpid())
+	if startFile := os.Getenv("BOTFABRIC_HELPER_ALLOC_START_FILE"); startFile != "" {
+		for {
+			if _, err := os.Stat(startFile); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 	// 逐页触碰让内核真正分配物理页；未触碰的匿名内存不计入 RSS。
 	buffer := make([]byte, bytes)
 	for offset := int64(0); offset < bytes; offset += 4096 {

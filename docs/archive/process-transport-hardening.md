@@ -140,8 +140,6 @@ fake 替身实现 `Send/Recv/Context/SendMsg/RecvMsg/SetHeader/SendHeader/SetTra
 
 ### 搁置项
 
-- cgroups v2 memory.max 是更硬的内核级边界（OOM kill 由内核执行），留独立切片。
-- 监控只覆盖直接子进程 PID；子孙进程内存不计入，cgroups 切片可一并解决。
 - Windows 无 /proc，内存监控自动禁用（Manifest Memory 仅作配置记录）。
 
 ### 验证
@@ -150,3 +148,47 @@ fake 替身实现 `Send/Recv/Context/SendMsg/RecvMsg/SetHeader/SendHeader/SetTra
 - `gofmt`：通过
 - `go test -count=1 ./...`：通过
 - `go test -count=1 -race ./internal/process/`：通过
+
+## 当前切片：cgroup v2 memory.max 内核内存限制（2026-09-25，已完成）
+
+### 实施结果
+
+RSS 轮询只能看到直接子进程，且是事后杀。本切片在 Linux 上优先用 systemd transient service 的 `MemoryMax` 设置 cgroup v2 `memory.max`，属性在进程启动前生效并覆盖整棵进程树；不可用时回退 RSS 轮询。
+
+1. `internal/process/cgroup_linux.go`（`//go:build linux`）
+   - `startCgroupMemoryLimit`：用 `systemd-run --user` 启动 transient service，直接设置 `MemoryMax`、`MemorySwapMax=0`、`OOMPolicy=continue` 和 `KillMode=control-group`。systemd 把插件及 fork 出的所有后代放进同一 cgroup，内核在超限时 OOM kill 触发进程。
+   - 插件环境写入权限为 `0600` 的 `EnvironmentFile`，避免 Session Token 出现在 `systemd-run` 命令行参数中。
+   - stdout/stderr 追加到普通文件，`tailProcessLog` 轮询增量并按行转发，保持按插件 ID 记录日志的行为。
+   - systemd、属性或环境文件任一前置条件失败都返回 nil，调用方回退 RSS 轮询。
+2. `internal/process/cgroup_other.go`（`//go:build !linux`）：`startCgroupMemoryLimit` 恒返回 nil，`waitManagedProcess` 回退 `exec.Cmd.Wait`。
+3. `internal/process/process_group.go`：`memoryEnforcer` 统一两种手段（stop 停止日志转发、reaper 终止托管服务、managed 标记进程归属）。
+4. `internal/process/grpc_transport.go`：`start` 优先走 cgroup service（由它启动并托管进程），失败回退直接 exec + RSS 监控；`killProcess` 对托管服务调用 systemd stop；`waitProcess` 对托管进程用 PID 轮询（systemd 启动的进程不是 Runtime 子进程，`os.Process.Wait` 只返回 ECHILD）。
+
+### 方案决策
+
+- **不先启动再迁移 cgroup**：迁移前存在无约束窗口，而且用户 session scope 往往由 root 拥有，普通用户不能把其中的进程移出。systemd 在创建服务 cgroup 时直接应用 `MemoryMax`，启动及早期 fork 都受约束。
+- **`OOMPolicy=continue`**：实测默认 `stop` 会在任一后代 OOM 时停止整个 transient service。`continue` 让内核只回收触发超限的进程，正常的插件主进程可继续运行。
+- **`KillMode=control-group`**：停止服务时由 systemd 回收服务 cgroup 内的全部后代，避免只杀主进程留下孙进程。
+- **日志用普通文件**：FIFO 在 systemd `append:` 下要么写端缺失导致插件 SIGPIPE（status=209/STDOUT），要么读端持有写端导致清理死锁。普通文件加轮询 tail 没有这些语义问题。
+- **环境文件权限 `0600`**：`--setenv` 会把变量值放进 `systemd-run` 参数；EnvironmentFile 避免 Session Token 出现在进程参数中。
+
+### 验证
+
+- `TestGRPCTransportCgroupCoversDescendants`：64MiB 上限下 helper fork 出触碰 512MiB 的孙进程，内核 OOM 回收孙进程而主进程不受影响。
+- 现有内存、进程组、握手测试在 cgroup 路径下全部通过（三次连跑）。
+- `go test -count=1 -race ./internal/process/`：通过
+- `go vet ./...`、`gofmt`、`go test ./...`：通过
+
+### 搁置项
+
+- 无用户委派 cgroup 的环境（无 systemd user manager、或 memory 控制器未委派）自动回退 RSS 轮询，只覆盖直接子进程。
+- cgroup 路径依赖 `systemd-run --user`；容器内无 systemd 时同样回退。集成测试在该路径不可用时会清理插件并跳过 cgroup 专项断言，避免误触发大内存分配。
+
+### 最终验证（2026-10-03）
+
+- `go test -count=1 ./...`：通过
+- `go test -count=1 -race ./...`：通过
+- `go vet ./...`：通过
+- `go build ./...`：通过
+- `GOOS=windows GOARCH=amd64 go test -exec=true ./internal/process/`：通过（交叉编译验证）
+- `gofmt`、`git diff --check`：通过
