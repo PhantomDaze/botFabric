@@ -43,13 +43,14 @@ BotFabric 是位于 QQ 协议端与应用端之间的**完全插件化机器人�
 - 响应协调器：CandidateReply、first-wins、priority-override、幂等和指定机器人回复；
 - 四个路由预设：broadcast、regex、competition、required-bot；
 - 应用端 OneBot v11/v12：服务端等待应用连接、主动连接远端应用、事件推送和候选回复回收；
-- Bearer Token 管理与诊断 API。
+- Bearer Token 管理与诊断 API；
+- 外部进程插件的 Unix Socket 双向 gRPC Session、短期会话令牌、事件/服务双向通信和进程组回收；Linux 可通过 systemd transient service 使用 cgroup v2 限制整棵进程树的内存，不可用时回退 RSS 监控；
+- Go、Python 与 TypeScript 外部进程插件 SDK；
 
 暂未完成或仅提供骨架：
 
-- 外部进程插件传输层：Runtime 托管的 Unix Socket 双向 gRPC Session、随机会话令牌、事件/服务双向通信和子进程生命周期治理；
 - LLM 分类器目前只有公共接口和 mock 实现，不连接真实模型 API；
-- Python/TypeScript SDK 和高级沙箱仍属于后续切片。
+- 高级沙箱和性能基准仍属于后续切片。
 
 ## 文档导航
 
