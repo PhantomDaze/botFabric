@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "botfabric-sdk"
+version = "0.1.0"
+description = "BotFabric external process plugin SDK"
+requires-python = ">=3.11"
+dependencies = [
+  "grpcio>=1.75,<2",
+  "protobuf>=6.31,<7",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["botfabric*"]
