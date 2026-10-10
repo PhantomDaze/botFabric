@@ -203,10 +203,15 @@ func (t *GRPCTransport) start(ctx context.Context, manifest contract.Manifest, s
 		t.closeProcessDone()
 		return err
 	}
-	// 内存限制优先走 cgroup v2 memory.max：由它启动并托管进程（内核 OOM，
-	// 覆盖整棵进程树）。不可用时回退为直接 exec，再用 RSS 轮询兜底（只覆盖直接子进程）。
+	// 需要网络隔离时必须使用 systemd transient service；不可用会在上方 fail closed。
+	// 仅内存限制可在 cgroup 不可用时回退为直接 exec + RSS 轮询（只覆盖直接子进程）。
 	limit := memoryLimitBytes(manifest)
-	enforcer := startCgroupMemoryLimit(command, limit, t.config.Logger, manifest.ID)
+	enforcer, err := startCgroupMemoryLimit(command, limit, manifest.Limits.PrivateNetwork, t.config.Logger, manifest.ID)
+	if err != nil {
+		_ = t.cleanup()
+		t.closeProcessDone()
+		return fmt.Errorf("启动需要网络隔离的外部插件失败: %w", err)
+	}
 	if enforcer == nil {
 		if err := command.Start(); err != nil {
 			_ = t.cleanup()

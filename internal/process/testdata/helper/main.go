@@ -102,6 +102,15 @@ func run() error {
 			return fmt.Errorf("fork 长驻子进程: %w", err)
 		}
 	}
+	if address := os.Getenv("BOTFABRIC_HELPER_PROBE_TCP"); address != "" {
+		connection, err := net.DialTimeout("tcp", address, time.Second)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "private network probe: blocked: %v\n", err)
+		} else {
+			_ = connection.Close()
+			fmt.Fprintln(os.Stderr, "private network probe: connected")
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

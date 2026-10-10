@@ -24,23 +24,28 @@ const (
 	cgroupLogPollInterval = 100 * time.Millisecond
 )
 
-// startCgroupMemoryLimit 使用 systemd transient service 的 MemoryMax 为插件设置
-// cgroup v2 memory.max。服务属性在进程启动前生效，避免先启动再迁移的无约束窗口；
-// systemd 将插件及其 fork 出的所有后代放进同一 cgroup。
-// 环境或属性不可用时返回 nil，由调用方回退到直接 exec + RSS 监控。
-func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, logger *slog.Logger, pluginID string) *memoryEnforcer {
-	if bytes <= 0 || command == nil {
-		return nil
+// startCgroupMemoryLimit 使用 systemd transient service 设置 cgroup v2 内存限制，
+// 并可按需启用 PrivateNetwork 网络命名空间。网络隔离请求失败时返回错误，
+// 由调用方拒绝无隔离启动；只有内存限制失败时允许回退 RSS 监控。
+func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, privateNetwork bool, logger *slog.Logger, pluginID string) (*memoryEnforcer, error) {
+	if command == nil || (bytes <= 0 && !privateNetwork) {
+		return nil, nil
 	}
 	systemdRun, err := exec.LookPath("systemd-run")
 	if err != nil {
-		return nil
+		if privateNetwork {
+			return nil, fmt.Errorf("找不到 systemd-run: %w", err)
+		}
+		return nil, nil
 	}
 
-	unit, pid, stdoutPath, stderrPath, logDir, err := startTransientService(systemdRun, command, bytes)
+	unit, pid, stdoutPath, stderrPath, logDir, err := startTransientService(systemdRun, command, bytes, privateNetwork)
 	if err != nil {
+		if privateNetwork {
+			return nil, err
+		}
 		logger.Warn("以 transient service 启动内存受限插件失败，回退 RSS 监控", "plugin_id", pluginID, "error", err)
-		return nil
+		return nil, nil
 	}
 	command.Process = &os.Process{Pid: pid}
 
@@ -55,19 +60,19 @@ func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, logger *slog.Logger,
 		_ = os.RemoveAll(logDir)
 	})
 
-	logger.Info("外部插件已纳入 cgroup v2 内存限制", "plugin_id", pluginID, "memory_max_bytes", bytes, "unit", unit)
+	logger.Info("外部插件已启动 systemd 托管", "plugin_id", pluginID, "memory_max_bytes", bytes, "private_network", privateNetwork, "unit", unit)
 	return &memoryEnforcer{
 		stop:    stopLogs,
 		managed: true,
 		reaper:  transientReaper(unit),
-	}
+	}, nil
 }
 
 // startTransientService 先设置 systemd cgroup 属性，再启动插件。
 //
 // stdout/stderr 追加到普通文件并由 tailProcessLog 转发。环境变量通过权限为
 // 0600 的 EnvironmentFile 传递，避免 Session Token 出现在 systemd-run 参数中。
-func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int64) (unit string, pid int, stdoutPath, stderrPath, logDir string, err error) {
+func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int64, privateNetwork bool) (unit string, pid int, stdoutPath, stderrPath, logDir string, err error) {
 	logDir, err = os.MkdirTemp("", "botfabric-log-")
 	if err != nil {
 		return "", 0, "", "", "", err
@@ -84,16 +89,22 @@ func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int
 	args := []string{
 		"--user", "--collect", "--no-block", "--unit=" + unit,
 		"-p", "KillMode=control-group",
-		"-p", "MemoryMax=" + strconv.FormatInt(memoryBytes, 10),
-		"-p", "MemorySwapMax=0",
-		"-p", "OOMPolicy=continue",
 		"-p", "StandardOutput=append:" + stdoutPath,
 		"-p", "StandardError=append:" + stderrPath,
 		"-p", "EnvironmentFile=" + envPath,
-		"--", command.Path,
 	}
+	if memoryBytes > 0 {
+		args = append(args,
+			"-p", "MemoryMax="+strconv.FormatInt(memoryBytes, 10),
+			"-p", "MemorySwapMax=0",
+			"-p", "OOMPolicy=continue",
+		)
+	}
+	if privateNetwork {
+		args = append(args, "-p", "PrivateNetwork=yes")
+	}
+	args = append(args, "--", command.Path)
 	args = append(args, command.Args[1:]...)
-
 	run := exec.Command(systemdRun, args...)
 	if output, runErr := run.CombinedOutput(); runErr != nil {
 		_ = os.RemoveAll(logDir)

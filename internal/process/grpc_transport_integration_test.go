@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,67 @@ func (integrationAllowPolicy) AllowPublish(string, string) bool        { return 
 func (integrationAllowPolicy) AllowSubscribe(string, string) bool      { return true }
 func (integrationAllowPolicy) AllowInvoke(string, string, string) bool { return true }
 func (integrationAllowPolicy) AllowProvide(string, string) bool        { return true }
+
+func TestGRPCTransportPrivateNetworkIsolation(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("PrivateNetwork 仅 Linux 支持")
+	}
+	probeListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probeListener.Close()
+
+	logFile, err := os.CreateTemp(t.TempDir(), "private-network-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	logger := slog.New(slog.NewTextHandler(logFile, nil))
+	helper := buildProcessHelper(t)
+	transport, err := NewGRPCTransport(GRPCTransportConfig{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	manifest.Entry = helper
+	manifest.Limits.PrivateNetwork = true
+	t.Setenv("BOTFABRIC_HELPER_PROBE_TCP", probeListener.Addr().String())
+	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
+	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
+		t.Skipf("PrivateNetwork transient service 不可用: %v", err)
+	}
+	defer transport.Kill()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := transport.Connect(ctx, socketPath); err != nil {
+		t.Fatalf("插件即使隔离网络仍应连接 Unix Socket Session: %v", err)
+	}
+	if err := transport.HandshakeWithCallbacks(ctx, manifest, session, SessionCallbacks{}); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := logFile.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		content, err := os.ReadFile(logFile.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(content), "private network probe: blocked") {
+			return
+		}
+		if strings.Contains(string(content), "private network probe: connected") {
+			t.Fatalf("隔离插件仍可连接宿主 loopback: %s", content)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("未观察到网络隔离探测结果")
+}
 
 func TestGRPCTransportProcessSession(t *testing.T) {
 	helper := buildProcessHelper(t)
@@ -475,6 +537,7 @@ func TestGRPCTransportKillsProcessGroup(t *testing.T) {
 	}
 	manifest := processManifest()
 	manifest.Entry = helper
+	manifest.Limits.Memory = ""
 	t.Setenv("BOTFABRIC_HELPER_FORK_CHILD", "1")
 	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
 	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
@@ -506,28 +569,35 @@ func TestGRPCTransportKillsProcessGroup(t *testing.T) {
 		t.Fatal("helper 进程未退出")
 	}
 
-	// 子进程 PID 从 helper 的 stderr 日志解析；cleanup 会等待文件 tail 扫尾完成。
-	if err := childLog.Sync(); err != nil {
-		t.Fatal(err)
-	}
-	content, err := os.ReadFile(childLog.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
+	// 子进程 PID 从 helper 的 stderr 日志解析；异步日志 tail 可能稍晚于 processDone 写完。
 	var childPID int
-	for _, line := range strings.Split(string(content), "\n") {
-		// slog 文本格式把 helper stderr 行包进 message="..."，先剥壳再匹配前缀。
-		if idx := strings.Index(line, `message="`); idx >= 0 {
-			if end := strings.Index(line[idx+9:], `"`); end >= 0 {
-				line = line[idx+9 : idx+9+end]
+	var content []byte
+	logDeadline := time.Now().Add(2 * time.Second)
+	for childPID == 0 && time.Now().Before(logDeadline) {
+		if err := childLog.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		content, err = os.ReadFile(childLog.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(string(content), "\n") {
+			// slog 文本格式把 helper stderr 行包进 message="..."，先剥壳再匹配前缀。
+			if idx := strings.Index(line, `message="`); idx >= 0 {
+				if end := strings.Index(line[idx+9:], `"`); end >= 0 {
+					line = line[idx+9 : idx+9+end]
+				}
+			}
+			line = strings.TrimSuffix(line, `\n`)
+			if prefix := "helper child pid: "; strings.HasPrefix(line, prefix) {
+				value, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, prefix)))
+				if err == nil {
+					childPID = value
+				}
 			}
 		}
-		line = strings.TrimSuffix(line, `\n`)
-		if prefix := "helper child pid: "; strings.HasPrefix(line, prefix) {
-			value, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, prefix)))
-			if err == nil {
-				childPID = value
-			}
+		if childPID == 0 {
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 	if childPID == 0 {

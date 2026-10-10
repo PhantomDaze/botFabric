@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/PhantomDaze/botfabric/pkg/contract"
@@ -59,6 +60,81 @@ routing:
 	}
 	if manifest.Routing.Rules[0].Action.Response.Timeout.String() != "3s" {
 		t.Fatalf("响应超时 = %s", manifest.Routing.Rules[0].Action.Response.Timeout)
+	}
+}
+
+func TestLoadManifestPrivateNetwork(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private-network.yaml")
+	content := `id: process.network
+name: Process Network
+version: 0.1.0
+runtime: process
+entry: ./plugin
+provides:
+  services: []
+  subscriptions: []
+requires:
+  services: []
+  permissions: []
+limits:
+  timeout: 2s
+  memory: 64MiB
+  private_network: true
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := LoadManifest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !manifest.Limits.PrivateNetwork {
+		t.Fatal("private_network 未解析")
+	}
+}
+
+func TestValidateManifestRejectsPrivateNetworkForInProcess(t *testing.T) {
+	manifest := contract.Manifest{
+		ID:      "inprocess.network",
+		Name:    "In-process Network",
+		Version: "0.1.0",
+		Runtime: contract.RuntimeInProcess,
+		Entry:   "builtin.example",
+		Limits:  contract.Limits{Timeout: 1, PrivateNetwork: true},
+	}
+	if err := ValidateManifest(manifest); err == nil {
+		t.Fatal("in_process 插件不应声明 private_network")
+	}
+}
+
+func TestValidateManifestAcceptsPrivateNetworkForProcess(t *testing.T) {
+	manifest := contract.Manifest{
+		ID:      "process.network",
+		Name:    "Process Network",
+		Version: "0.1.0",
+		Runtime: contract.RuntimeProcess,
+		Entry:   "./plugin",
+		Limits:  contract.Limits{Timeout: 1, Memory: "64MiB", PrivateNetwork: true},
+	}
+	if err := ValidateManifest(manifest); err != nil {
+		t.Fatalf("process 插件的 private_network 应有效: %v", err)
+	}
+}
+
+func TestValidateManifestRejectsPrivateNetworkOnUnsupportedPlatform(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("Linux 支持 private_network")
+	}
+	manifest := contract.Manifest{
+		ID:      "process.network",
+		Name:    "Process Network",
+		Version: "0.1.0",
+		Runtime: contract.RuntimeProcess,
+		Entry:   "./plugin",
+		Limits:  contract.Limits{Timeout: 1, Memory: "64MiB", PrivateNetwork: true},
+	}
+	if err := ValidateManifest(manifest); err == nil {
+		t.Fatal("非 Linux 平台不应接受 private_network")
 	}
 }
 
