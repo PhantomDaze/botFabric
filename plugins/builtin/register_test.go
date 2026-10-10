@@ -5,6 +5,7 @@ import (
 
 	"github.com/PhantomDaze/botfabric/internal/runtime"
 	"github.com/PhantomDaze/botfabric/plugins/application/reply"
+	"github.com/PhantomDaze/botfabric/plugins/classifier"
 	"github.com/PhantomDaze/botfabric/plugins/protocol/mockonebot"
 )
 
@@ -23,6 +24,10 @@ func TestRegisterAddsAllBuiltinFactories(t *testing.T) {
 		}},
 		{name: reply.PluginID, load: func() error {
 			_, err := loader.Load(reply.New().Manifest(), nil)
+			return err
+		}},
+		{name: classifier.RealLLMID, load: func() error {
+			_, err := loader.Load(classifier.NewRealLLMPlugin().Manifest(), nil)
 			return err
 		}},
 	} {

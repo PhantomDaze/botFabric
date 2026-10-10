@@ -22,6 +22,9 @@ func Register(loader *runtime.BuiltinLoader) error {
 		{entry: classifier.MockEntry, factory: func() contract.Plugin {
 			return classifier.NewPlugin(contract.DispatchPlan{Mode: contract.DispatchBroadcast})
 		}},
+		{entry: classifier.RealLLMEntry, factory: func() contract.Plugin {
+			return classifier.NewRealLLMPlugin()
+		}},
 		{entry: routing.BroadcastEntry, factory: func() contract.Plugin { return routing.New(routing.BroadcastManifest()) }},
 		{entry: routing.RegexEntry, factory: func() contract.Plugin { return routing.New(routing.RegexManifest()) }},
 		{entry: routing.CompetitionEntry, factory: func() contract.Plugin { return routing.New(routing.CompetitionManifest()) }},
