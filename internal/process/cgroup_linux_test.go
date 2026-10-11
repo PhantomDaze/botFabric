@@ -27,7 +27,7 @@ func TestStartTransientServiceRequestsIsolationWithoutMemoryLimit(t *testing.T) 
 	t.Setenv("TMPDIR", tmp)
 
 	command := exec.Command("/bin/echo", "plugin-arg")
-	unit, pid, _, _, logDir, err := startTransientService(systemdRun, command, 0, true, true, true)
+	unit, pid, _, _, logDir, err := startTransientService(systemdRun, command, 0, true, true, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestStartTransientServiceNoNewPrivilegesWithoutMemoryLimit(t *testing.T) {
 	t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
 	t.Setenv("TMPDIR", tmp)
 
-	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, true, false)
+	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, true, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestStartTransientServicePrivateTmpWithoutOtherIsolation(t *testing.T) {
 	t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
 	t.Setenv("TMPDIR", tmp)
 
-	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, false, true)
+	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, false, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,16 +155,57 @@ func TestCreateTransientServiceLogDirWithPrivateTmpRejectsTemporaryDirectory(t *
 	}
 }
 
+func TestStartTransientServiceSyscallFilterWithoutOtherIsolation(t *testing.T) {
+	tmp := t.TempDir()
+	binDir := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argsPath := filepath.Join(tmp, "args")
+	systemdRun := filepath.Join(binDir, "systemd-run")
+	systemctl := filepath.Join(binDir, "systemctl")
+	writeExecutable(t, systemdRun, `#!/bin/sh
+printf '%s\n' "$@" > "$BOTFABRIC_TEST_ARGS"
+`)
+	writeExecutable(t, systemctl, `#!/bin/sh
+printf '1\n'
+`)
+	t.Setenv("PATH", binDir)
+	t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
+	t.Setenv("TMPDIR", tmp)
+
+	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, false, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(logDir)
+	content, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimSpace(string(content)), "\n")
+	if !containsAdjacent(args, "-p", "SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap @cpu-emulation") {
+		t.Fatalf("systemd-run 参数未启用固定 syscall filter: %q", args)
+	}
+	for _, property := range []string{"PrivateNetwork=yes", "NoNewPrivileges=yes", "PrivateTmp=yes", "MemoryMax=0"} {
+		if containsAdjacent(args, "-p", property) {
+			t.Fatalf("syscall-filter-only 不应隐式启用 %s: %q", property, args)
+		}
+	}
+}
+
 func TestStartCgroupIsolationFailsClosed(t *testing.T) {
 	for _, test := range []struct {
-		name           string
-		privateNetwork bool
-		noNewPrivs     bool
-		privateTmp     bool
+		name             string
+		privateNetwork   bool
+		noNewPrivs       bool
+		privateTmp       bool
+		restrictSyscalls bool
 	}{
 		{name: "private-network", privateNetwork: true},
 		{name: "no-new-privileges", noNewPrivs: true},
 		{name: "private-tmp", privateTmp: true},
+		{name: "restrict-syscalls", restrictSyscalls: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			tmp := t.TempDir()
@@ -176,7 +217,7 @@ func TestStartCgroupIsolationFailsClosed(t *testing.T) {
 			t.Setenv("PATH", binDir)
 			t.Setenv("TMPDIR", tmp)
 
-			enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 0, test.privateNetwork, test.noNewPrivs, test.privateTmp, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
+			enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 0, test.privateNetwork, test.noNewPrivs, test.privateTmp, test.restrictSyscalls, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
 			if err == nil || enforcer != nil {
 				t.Fatalf("隔离启动失败应返回错误而不降级: enforcer=%#v err=%v", enforcer, err)
 			}
@@ -203,7 +244,7 @@ func TestStartCgroupMemoryLimitKeepsMemoryFallback(t *testing.T) {
 	t.Setenv("PATH", binDir)
 	t.Setenv("TMPDIR", tmp)
 
-	enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 64*1024*1024, false, false, false, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
+	enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 64*1024*1024, false, false, false, false, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
 	if err != nil || enforcer != nil {
 		t.Fatalf("memory-only 失败应允许调用方回退 RSS: enforcer=%#v err=%v", enforcer, err)
 	}

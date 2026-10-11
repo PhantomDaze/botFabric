@@ -51,7 +51,7 @@ BotFabric 是位于 QQ 协议端与应用端之间的**完全插件化机器人�
 暂未完成或仅提供骨架：
 
 - LLM 分类器尚未覆盖真实供应商兼容矩阵和模型路由质量评估；
-- 高级沙箱仍属于后续切片；外部进程插件现支持 Linux opt-in 的 `private_network`、`no_new_privileges` 与 `private_tmp`，但尚无细粒度 egress allowlist、seccomp 或其他平台的等价隔离；`Router.Plan` 已提供默认广播和规则匹配的 Go 性能基准，用于本机比较，不构成跨环境性能承诺。
+- 高级沙箱仍有待完善；外部进程插件现支持 Linux opt-in 的 `private_network`、`no_new_privileges`、`private_tmp` 与固定 syscall 拒绝组，但尚无细粒度 egress allowlist、capability 白名单或其他平台的等价隔离；`Router.Plan` 已提供默认广播和规则匹配的 Go 性能基准，用于本机比较，不构成跨环境性能承诺。
 - 内存去重器 `Deduplicator.Check` 已提供消息 ID 与文本指纹新事件路径基准（`go test ./internal/dedup -run '^$' -bench '^BenchmarkDeduplicatorCheck' -benchmem`），仅作本机性能对比。
 
 ## 真实 LLM 分类器

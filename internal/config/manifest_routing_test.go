@@ -82,6 +82,7 @@ limits:
   private_network: true
   no_new_privileges: true
   private_tmp: true
+  restrict_syscalls: true
 `
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -90,7 +91,7 @@ limits:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !manifest.Limits.PrivateNetwork || !manifest.Limits.NoNewPrivileges || !manifest.Limits.PrivateTmp {
+	if !manifest.Limits.PrivateNetwork || !manifest.Limits.NoNewPrivileges || !manifest.Limits.PrivateTmp || !manifest.Limits.RestrictSyscalls {
 		t.Fatalf("隔离限制未解析: %#v", manifest.Limits)
 	}
 }
@@ -131,6 +132,7 @@ func TestValidateManifestRejectsIsolationOnUnsupportedPlatform(t *testing.T) {
 		{Timeout: 1, Memory: "64MiB", PrivateNetwork: true},
 		{Timeout: 1, Memory: "64MiB", NoNewPrivileges: true},
 		{Timeout: 1, Memory: "64MiB", PrivateTmp: true},
+		{Timeout: 1, Memory: "64MiB", RestrictSyscalls: true},
 	} {
 		manifest := contract.Manifest{
 			ID:      "process.isolation",
@@ -171,6 +173,51 @@ func TestValidateManifestAcceptsNoNewPrivilegesForProcess(t *testing.T) {
 	}
 	if err := ValidateManifest(manifest); err != nil {
 		t.Fatalf("process 插件的 no_new_privileges 应有效: %v", err)
+	}
+}
+
+func TestValidateManifestRejectsRestrictSyscallsForInProcess(t *testing.T) {
+	manifest := contract.Manifest{
+		ID:      "inprocess.syscalls",
+		Name:    "In-process Syscalls",
+		Version: "0.1.0",
+		Runtime: contract.RuntimeInProcess,
+		Entry:   "builtin.example",
+		Limits:  contract.Limits{Timeout: 1, RestrictSyscalls: true},
+	}
+	if err := ValidateManifest(manifest); err == nil {
+		t.Fatal("in_process 插件不应声明 restrict_syscalls")
+	}
+}
+
+func TestValidateManifestAcceptsRestrictSyscallsForProcess(t *testing.T) {
+	manifest := contract.Manifest{
+		ID:      "process.syscalls",
+		Name:    "Process Syscalls",
+		Version: "0.1.0",
+		Runtime: contract.RuntimeProcess,
+		Entry:   "./plugin",
+		Limits:  contract.Limits{Timeout: 1, Memory: "64MiB", RestrictSyscalls: true},
+	}
+	if err := ValidateManifest(manifest); err != nil {
+		t.Fatalf("process 插件的 restrict_syscalls 应有效: %v", err)
+	}
+}
+
+func TestValidateManifestRejectsRestrictSyscallsOnUnsupportedPlatform(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("Linux 支持 restrict_syscalls")
+	}
+	manifest := contract.Manifest{
+		ID:      "process.syscalls",
+		Name:    "Process Syscalls",
+		Version: "0.1.0",
+		Runtime: contract.RuntimeProcess,
+		Entry:   "./plugin",
+		Limits:  contract.Limits{Timeout: 1, Memory: "64MiB", RestrictSyscalls: true},
+	}
+	if err := ValidateManifest(manifest); err == nil {
+		t.Fatal("非 Linux 平台不应接受 restrict_syscalls")
 	}
 }
 

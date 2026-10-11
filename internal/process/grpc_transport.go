@@ -211,7 +211,7 @@ func (t *GRPCTransport) start(ctx context.Context, manifest contract.Manifest, s
 	// 请求任何隔离属性时都必须使用 systemd transient service；失败时不降级。
 	// 仅 memory 限制在 cgroup 不可用时回退 RSS 轮询（只覆盖直接子进程）。
 	limit := memoryLimitBytes(manifest)
-	enforcer, err := startCgroupMemoryLimit(command, limit, manifest.Limits.PrivateNetwork, manifest.Limits.NoNewPrivileges, manifest.Limits.PrivateTmp, t.config.Logger, manifest.ID)
+	enforcer, err := startCgroupMemoryLimit(command, limit, manifest.Limits.PrivateNetwork, manifest.Limits.NoNewPrivileges, manifest.Limits.PrivateTmp, manifest.Limits.RestrictSyscalls, t.config.Logger, manifest.ID)
 	if err != nil {
 		_ = t.cleanup()
 		t.closeProcessDone()

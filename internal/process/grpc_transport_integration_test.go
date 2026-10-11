@@ -108,6 +108,68 @@ func TestGRPCTransportPrivateNetworkIsolation(t *testing.T) {
 	t.Fatal("未观察到网络隔离探测结果")
 }
 
+func TestGRPCTransportRestrictSyscallsEnablesSeccomp(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("系统调用过滤仅 Linux 支持")
+	}
+	baselineStatus, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineFilters := seccompFilterCount(t, baselineStatus)
+	helper := buildProcessHelper(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	transport, err := NewGRPCTransport(GRPCTransportConfig{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	manifest.Entry = helper
+	manifest.Limits.RestrictSyscalls = true
+	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
+	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
+		t.Skipf("syscall filter transient service 不可用: %v", err)
+	}
+	defer transport.Kill()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := transport.Connect(ctx, socketPath); err != nil {
+		t.Fatalf("过滤 syscall 后插件仍应连接 Unix Socket Session: %v", err)
+	}
+	if err := transport.HandshakeWithCallbacks(ctx, manifest, session, SessionCallbacks{}); err != nil {
+		t.Fatal(err)
+	}
+
+	transport.mu.RLock()
+	command := transport.process
+	transport.mu.RUnlock()
+	if command == nil || command.Process == nil {
+		t.Fatal("缺少由 systemd 启动的插件进程")
+	}
+	status, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(command.Process.Pid), "status"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seccompFilterCount(t, status) <= baselineFilters {
+		t.Fatalf("插件进程未增加 systemd seccomp filter：baseline=%d status=%s", baselineFilters, status)
+	}
+}
+
+func seccompFilterCount(t *testing.T, status []byte) int {
+	t.Helper()
+	match := regexp.MustCompile(`(?m)^Seccomp_filters:\s+(\d+)$`).FindSubmatch(status)
+	if match == nil {
+		t.Fatalf("进程状态缺少 Seccomp_filters: %s", status)
+	}
+	count, err := strconv.Atoi(string(match[1]))
+	if err != nil {
+		t.Fatalf("解析 seccomp filter 数量: %v", err)
+	}
+	return count
+}
+
 func TestGRPCTransportPrivateTmpRejectsSocketInPrivateDirectory(t *testing.T) {
 	for _, directory := range []string{"/tmp", "/var/tmp"} {
 		t.Run(directory, func(t *testing.T) {
