@@ -80,6 +80,7 @@ limits:
   timeout: 2s
   memory: 64MiB
   private_network: true
+  no_new_privileges: true
 `
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -88,8 +89,8 @@ limits:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !manifest.Limits.PrivateNetwork {
-		t.Fatal("private_network 未解析")
+	if !manifest.Limits.PrivateNetwork || !manifest.Limits.NoNewPrivileges {
+		t.Fatalf("隔离限制未解析: %#v", manifest.Limits)
 	}
 }
 
@@ -121,20 +122,53 @@ func TestValidateManifestAcceptsPrivateNetworkForProcess(t *testing.T) {
 	}
 }
 
-func TestValidateManifestRejectsPrivateNetworkOnUnsupportedPlatform(t *testing.T) {
+func TestValidateManifestRejectsIsolationOnUnsupportedPlatform(t *testing.T) {
 	if runtime.GOOS == "linux" {
-		t.Skip("Linux 支持 private_network")
+		t.Skip("Linux 支持插件隔离选项")
 	}
+	for _, limits := range []contract.Limits{
+		{Timeout: 1, Memory: "64MiB", PrivateNetwork: true},
+		{Timeout: 1, Memory: "64MiB", NoNewPrivileges: true},
+	} {
+		manifest := contract.Manifest{
+			ID:      "process.isolation",
+			Name:    "Process Isolation",
+			Version: "0.1.0",
+			Runtime: contract.RuntimeProcess,
+			Entry:   "./plugin",
+			Limits:  limits,
+		}
+		if err := ValidateManifest(manifest); err == nil {
+			t.Fatalf("非 Linux 平台不应接受隔离配置: %#v", limits)
+		}
+	}
+}
+
+func TestValidateManifestRejectsNoNewPrivilegesForInProcess(t *testing.T) {
 	manifest := contract.Manifest{
-		ID:      "process.network",
-		Name:    "Process Network",
+		ID:      "inprocess.nnp",
+		Name:    "In-process NNP",
+		Version: "0.1.0",
+		Runtime: contract.RuntimeInProcess,
+		Entry:   "builtin.example",
+		Limits:  contract.Limits{Timeout: 1, NoNewPrivileges: true},
+	}
+	if err := ValidateManifest(manifest); err == nil {
+		t.Fatal("in_process 插件不应声明 no_new_privileges")
+	}
+}
+
+func TestValidateManifestAcceptsNoNewPrivilegesForProcess(t *testing.T) {
+	manifest := contract.Manifest{
+		ID:      "process.nnp",
+		Name:    "Process NNP",
 		Version: "0.1.0",
 		Runtime: contract.RuntimeProcess,
 		Entry:   "./plugin",
-		Limits:  contract.Limits{Timeout: 1, Memory: "64MiB", PrivateNetwork: true},
+		Limits:  contract.Limits{Timeout: 1, Memory: "64MiB", NoNewPrivileges: true},
 	}
-	if err := ValidateManifest(manifest); err == nil {
-		t.Fatal("非 Linux 平台不应接受 private_network")
+	if err := ValidateManifest(manifest); err != nil {
+		t.Fatalf("process 插件的 no_new_privileges 应有效: %v", err)
 	}
 }
 

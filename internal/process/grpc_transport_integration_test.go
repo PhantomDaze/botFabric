@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -54,6 +55,7 @@ func TestGRPCTransportPrivateNetworkIsolation(t *testing.T) {
 	manifest := processManifest()
 	manifest.Entry = helper
 	manifest.Limits.PrivateNetwork = true
+	manifest.Limits.NoNewPrivileges = true
 	t.Setenv("BOTFABRIC_HELPER_PROBE_TCP", probeListener.Addr().String())
 	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
 	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
@@ -69,6 +71,20 @@ func TestGRPCTransportPrivateNetworkIsolation(t *testing.T) {
 	}
 	if err := transport.HandshakeWithCallbacks(ctx, manifest, session, SessionCallbacks{}); err != nil {
 		t.Fatal(err)
+	}
+
+	transport.mu.RLock()
+	command := transport.process
+	transport.mu.RUnlock()
+	if command == nil || command.Process == nil {
+		t.Fatal("缺少由 systemd 启动的插件进程")
+	}
+	status, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(command.Process.Pid), "status"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile(`(?m)^NoNewPrivs:\s+1$`).Match(status) {
+		t.Fatalf("插件进程未启用 NoNewPrivileges: %s", status)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)

@@ -8,10 +8,10 @@ import (
 	"os/exec"
 )
 
-// startCgroupMemoryLimit 在非 Linux 平台不可用；显式请求网络隔离时返回错误，拒绝无隔离启动。
-func startCgroupMemoryLimit(_ *exec.Cmd, _ int64, privateNetwork bool, _ *slog.Logger, _ string) (*memoryEnforcer, error) {
-	if privateNetwork {
-		return nil, errors.New("Linux systemd 网络命名空间隔离不可用")
+// startCgroupMemoryLimit 在非 Linux 平台不可用；显式请求隔离属性时拒绝启动。
+func startCgroupMemoryLimit(_ *exec.Cmd, _ int64, privateNetwork, noNewPrivileges bool, _ *slog.Logger, _ string) (*memoryEnforcer, error) {
+	if privateNetwork || noNewPrivileges {
+		return nil, errors.New("Linux systemd 进程隔离属性不可用")
 	}
 	return nil, nil
 }
