@@ -25,23 +25,23 @@ const (
 )
 
 // startCgroupMemoryLimit 使用 systemd transient service 设置 cgroup v2 内存限制，
-// 并可按需启用 PrivateNetwork 和 NoNewPrivileges。隔离请求失败时返回错误，
+// 并可按需启用 PrivateNetwork、NoNewPrivileges 和 PrivateTmp。隔离请求失败时返回错误，
 // 由调用方拒绝无隔离启动；只有内存限制失败时允许回退 RSS 监控。
-func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, privateNetwork, noNewPrivileges bool, logger *slog.Logger, pluginID string) (*memoryEnforcer, error) {
-	if command == nil || (bytes <= 0 && !privateNetwork && !noNewPrivileges) {
+func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, privateNetwork, noNewPrivileges, privateTmp bool, logger *slog.Logger, pluginID string) (*memoryEnforcer, error) {
+	if command == nil || (bytes <= 0 && !privateNetwork && !noNewPrivileges && !privateTmp) {
 		return nil, nil
 	}
 	systemdRun, err := exec.LookPath("systemd-run")
 	if err != nil {
-		if privateNetwork || noNewPrivileges {
+		if privateNetwork || noNewPrivileges || privateTmp {
 			return nil, fmt.Errorf("找不到 systemd-run: %w", err)
 		}
 		return nil, nil
 	}
 
-	unit, pid, stdoutPath, stderrPath, logDir, err := startTransientService(systemdRun, command, bytes, privateNetwork, noNewPrivileges)
+	unit, pid, stdoutPath, stderrPath, logDir, err := startTransientService(systemdRun, command, bytes, privateNetwork, noNewPrivileges, privateTmp)
 	if err != nil {
-		if privateNetwork || noNewPrivileges {
+		if privateNetwork || noNewPrivileges || privateTmp {
 			return nil, err
 		}
 		logger.Warn("以 transient service 启动内存受限插件失败，回退 RSS 监控", "plugin_id", pluginID, "error", err)
@@ -60,7 +60,7 @@ func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, privateNetwork, noNe
 		_ = os.RemoveAll(logDir)
 	})
 
-	logger.Info("外部插件已启动 systemd 托管", "plugin_id", pluginID, "memory_max_bytes", bytes, "private_network", privateNetwork, "no_new_privileges", noNewPrivileges, "unit", unit)
+	logger.Info("外部插件已启动 systemd 托管", "plugin_id", pluginID, "memory_max_bytes", bytes, "private_network", privateNetwork, "no_new_privileges", noNewPrivileges, "private_tmp", privateTmp, "unit", unit)
 	return &memoryEnforcer{
 		stop:    stopLogs,
 		managed: true,
@@ -72,8 +72,8 @@ func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, privateNetwork, noNe
 //
 // stdout/stderr 追加到普通文件并由 tailProcessLog 转发。环境变量通过权限为
 // 0600 的 EnvironmentFile 传递，避免 Session Token 出现在 systemd-run 参数中。
-func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int64, privateNetwork, noNewPrivileges bool) (unit string, pid int, stdoutPath, stderrPath, logDir string, err error) {
-	logDir, err = os.MkdirTemp("", "botfabric-log-")
+func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int64, privateNetwork, noNewPrivileges, privateTmp bool) (unit string, pid int, stdoutPath, stderrPath, logDir string, err error) {
+	logDir, err = createTransientServiceLogDir(privateTmp)
 	if err != nil {
 		return "", 0, "", "", "", err
 	}
@@ -106,6 +106,9 @@ func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int
 	if noNewPrivileges {
 		args = append(args, "-p", "NoNewPrivileges=yes")
 	}
+	if privateTmp {
+		args = append(args, "-p", "PrivateTmp=yes")
+	}
 	args = append(args, "--", command.Path)
 	args = append(args, command.Args[1:]...)
 	run := exec.Command(systemdRun, args...)
@@ -121,6 +124,50 @@ func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int
 		return "", 0, "", "", "", err
 	}
 	return unit, pid, stdoutPath, stderrPath, logDir, nil
+}
+
+func createTransientServiceLogDir(privateTmp bool) (string, error) {
+	if !privateTmp {
+		return os.MkdirTemp("", "botfabric-log-")
+	}
+
+	base := os.Getenv("XDG_RUNTIME_DIR")
+	if base == "" {
+		base = os.Getenv("HOME")
+	}
+	if base == "" {
+		return "", errors.New("PrivateTmp 需要 XDG_RUNTIME_DIR 或 HOME 来存放 systemd 环境和日志文件")
+	}
+	info, err := os.Stat(base)
+	if err != nil {
+		return "", fmt.Errorf("检查 PrivateTmp 临时文件目录: %w", err)
+	}
+	if !info.IsDir() {
+		return "", errors.New("PrivateTmp systemd 临时文件路径不是目录")
+	}
+	resolved, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return "", fmt.Errorf("解析 PrivateTmp 临时文件目录: %w", err)
+	}
+	for _, root := range []string{"/tmp", "/var/tmp"} {
+		for _, candidate := range []string{base, resolved} {
+			for _, boundary := range []string{root, resolveExistingPath(root)} {
+				relative, relErr := filepath.Rel(boundary, candidate)
+				if relErr == nil && (relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))) {
+					return "", errors.New("PrivateTmp systemd 环境和日志文件目录不能位于 /tmp 或 /var/tmp")
+				}
+			}
+		}
+	}
+	return os.MkdirTemp(resolved, ".botfabric-log-")
+}
+
+func resolveExistingPath(path string) string {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return resolved
+	}
+	return path
 }
 
 // writeSystemdEnvironmentFile 安全写入 transient service 的环境文件。

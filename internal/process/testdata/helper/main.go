@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -109,6 +110,24 @@ func run() error {
 		} else {
 			_ = connection.Close()
 			fmt.Fprintln(os.Stderr, "private network probe: connected")
+		}
+	}
+	if marker := os.Getenv("BOTFABRIC_HELPER_PRIVATE_TMP_TMP_MARKER"); marker != "" {
+		_, tmpErr := os.Stat(marker)
+		varTmpMarker := os.Getenv("BOTFABRIC_HELPER_PRIVATE_TMP_VARTMP_MARKER")
+		_, varTmpErr := os.Stat(varTmpMarker)
+		writeTmp := filepath.Join("/tmp", fmt.Sprintf("botfabric-private-tmp-write-probe-%d", os.Getpid()))
+		writeVarTmp := filepath.Join("/var/tmp", fmt.Sprintf("botfabric-private-tmp-write-probe-%d", os.Getpid()))
+		tmpWriteErr := os.WriteFile(writeTmp, []byte("private"), 0o600)
+		varTmpWriteErr := os.WriteFile(writeVarTmp, []byte("private"), 0o600)
+		_ = os.Remove(writeTmp)
+		_ = os.Remove(writeVarTmp)
+		if errors.Is(tmpErr, os.ErrNotExist) && errors.Is(varTmpErr, os.ErrNotExist) && tmpWriteErr == nil && varTmpWriteErr == nil {
+			fmt.Fprintln(os.Stderr, "private tmp probe: isolated")
+		} else if tmpWriteErr != nil || varTmpWriteErr != nil {
+			fmt.Fprintf(os.Stderr, "private tmp probe: unable-to-write: /tmp=%v /var/tmp=%v\n", tmpWriteErr, varTmpWriteErr)
+		} else {
+			fmt.Fprintln(os.Stderr, "private tmp probe: exposed")
 		}
 	}
 

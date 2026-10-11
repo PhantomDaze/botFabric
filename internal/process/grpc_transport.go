@@ -138,6 +138,11 @@ func (t *GRPCTransport) start(ctx context.Context, manifest contract.Manifest, s
 		return errors.New("外部插件 transport 不支持重复启动")
 	}
 	t.mu.Unlock()
+	if manifest.Limits.PrivateTmp {
+		if err := validatePrivateTmpSocketPath(socketPath); err != nil {
+			return fmt.Errorf("启动需要 PrivateTmp 的外部插件失败: %w", err)
+		}
+	}
 	if err := prepareSocketPath(socketPath); err != nil {
 		return err
 	}
@@ -203,10 +208,10 @@ func (t *GRPCTransport) start(ctx context.Context, manifest contract.Manifest, s
 		t.closeProcessDone()
 		return err
 	}
-	// 需要网络隔离时必须使用 systemd transient service；不可用会在上方 fail closed。
-	// 仅内存限制可在 cgroup 不可用时回退为直接 exec + RSS 轮询（只覆盖直接子进程）。
+	// 请求任何隔离属性时都必须使用 systemd transient service；失败时不降级。
+	// 仅 memory 限制在 cgroup 不可用时回退 RSS 轮询（只覆盖直接子进程）。
 	limit := memoryLimitBytes(manifest)
-	enforcer, err := startCgroupMemoryLimit(command, limit, manifest.Limits.PrivateNetwork, manifest.Limits.NoNewPrivileges, t.config.Logger, manifest.ID)
+	enforcer, err := startCgroupMemoryLimit(command, limit, manifest.Limits.PrivateNetwork, manifest.Limits.NoNewPrivileges, manifest.Limits.PrivateTmp, t.config.Logger, manifest.ID)
 	if err != nil {
 		_ = t.cleanup()
 		t.closeProcessDone()
@@ -1073,6 +1078,53 @@ func asServiceErrorValue(err error) *contract.ServiceError {
 		return serviceError
 	}
 	return &contract.ServiceError{Code: contract.ErrorInternal, Message: err.Error()}
+}
+
+func validatePrivateTmpSocketPath(socketPath string) error {
+	absolute, err := filepath.Abs(filepath.Clean(socketPath))
+	if err != nil {
+		return fmt.Errorf("解析外部插件 Unix Socket 路径: %w", err)
+	}
+
+	resolved := filepath.Dir(absolute)
+	var suffix []string
+	for {
+		candidate := resolved
+		resolved, err = filepath.EvalSymlinks(candidate)
+		if err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("解析 Unix Socket 目录: %w", err)
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return fmt.Errorf("无法解析 Unix Socket 目录: %s", filepath.Dir(absolute))
+		}
+		suffix = append(suffix, filepath.Base(candidate))
+		resolved = parent
+	}
+
+	// 即使目录当前不存在也拒绝临时根下的路径；若父目录可解析，再检查符号链接目标。
+	directory := filepath.Dir(absolute)
+	for _, root := range []string{"/tmp", "/var/tmp"} {
+		blocked := root
+		if target, resolveErr := filepath.EvalSymlinks(root); resolveErr == nil {
+			blocked = target
+		}
+		for _, candidate := range []string{directory, resolved} {
+			for _, base := range []string{root, blocked} {
+				relative, relErr := filepath.Rel(base, candidate)
+				if relErr == nil && (relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))) {
+					return fmt.Errorf("PrivateTmp 插件的 Unix Socket 不能位于 %s 或其子目录", root)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func prepareSocketPath(path string) error {

@@ -27,7 +27,7 @@ func TestStartTransientServiceRequestsIsolationWithoutMemoryLimit(t *testing.T) 
 	t.Setenv("TMPDIR", tmp)
 
 	command := exec.Command("/bin/echo", "plugin-arg")
-	unit, pid, _, _, logDir, err := startTransientService(systemdRun, command, 0, true, true)
+	unit, pid, _, _, logDir, err := startTransientService(systemdRun, command, 0, true, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestStartTransientServiceRequestsIsolationWithoutMemoryLimit(t *testing.T) 
 		t.Fatal(err)
 	}
 	args := strings.Split(strings.TrimSpace(string(content)), "\n")
-	if !containsAdjacent(args, "-p", "PrivateNetwork=yes") || !containsAdjacent(args, "-p", "NoNewPrivileges=yes") {
+	if !containsAdjacent(args, "-p", "PrivateNetwork=yes") || !containsAdjacent(args, "-p", "NoNewPrivileges=yes") || !containsAdjacent(args, "-p", "PrivateTmp=yes") {
 		t.Fatalf("systemd-run 参数未启用隔离: %q", args)
 	}
 	if containsAdjacent(args, "-p", "MemoryMax=0") || containsAdjacent(args, "-p", "MemoryMax=1") {
@@ -66,7 +66,7 @@ func TestStartTransientServiceNoNewPrivilegesWithoutMemoryLimit(t *testing.T) {
 	t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
 	t.Setenv("TMPDIR", tmp)
 
-	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, true)
+	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,8 +79,79 @@ func TestStartTransientServiceNoNewPrivilegesWithoutMemoryLimit(t *testing.T) {
 	if !containsAdjacent(args, "-p", "NoNewPrivileges=yes") {
 		t.Fatalf("systemd-run 参数未启用 NoNewPrivileges: %q", args)
 	}
-	if containsAdjacent(args, "-p", "PrivateNetwork=yes") || containsAdjacent(args, "-p", "MemoryMax=0") {
+	if containsAdjacent(args, "-p", "PrivateNetwork=yes") || containsAdjacent(args, "-p", "PrivateTmp=yes") || containsAdjacent(args, "-p", "MemoryMax=0") {
 		t.Fatalf("NNP-only 不应隐式启用其他限制: %q", args)
+	}
+}
+
+func TestStartTransientServicePrivateTmpWithoutOtherIsolation(t *testing.T) {
+	tmp := t.TempDir()
+	binDir := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argsPath := filepath.Join(tmp, "args")
+	systemdRun := filepath.Join(binDir, "systemd-run")
+	systemctl := filepath.Join(binDir, "systemctl")
+	writeExecutable(t, systemdRun, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BOTFABRIC_TEST_ARGS\"\n")
+	writeExecutable(t, systemctl, "#!/bin/sh\nprintf '1\\n'\n")
+	t.Setenv("PATH", binDir)
+	t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
+	t.Setenv("TMPDIR", tmp)
+
+	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(logDir)
+	content, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimSpace(string(content)), "\n")
+	if !containsAdjacent(args, "-p", "PrivateTmp=yes") {
+		t.Fatalf("systemd-run 参数未启用 PrivateTmp: %q", args)
+	}
+	for _, property := range []string{"PrivateNetwork=yes", "NoNewPrivileges=yes", "MemoryMax=0"} {
+		if containsAdjacent(args, "-p", property) {
+			t.Fatalf("PrivateTmp-only 不应隐式启用 %s: %q", property, args)
+		}
+	}
+}
+
+func TestCreateTransientServiceLogDirWithPrivateTmpUsesPersistentDirectory(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeDir, err := os.MkdirTemp(home, ".botfabric-private-tmp-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(runtimeDir)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	t.Setenv("HOME", home)
+	t.Setenv("TMPDIR", t.TempDir())
+
+	path, err := createTransientServiceLogDir(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(path)
+	if !strings.HasPrefix(filepath.Base(path), ".botfabric-log-") {
+		t.Fatalf("PrivateTmp 日志目录格式异常: %q", path)
+	}
+}
+
+func TestCreateTransientServiceLogDirWithPrivateTmpRejectsTemporaryDirectory(t *testing.T) {
+	for _, base := range []string{"/tmp", "/var/tmp"} {
+		t.Run(base, func(t *testing.T) {
+			t.Setenv("XDG_RUNTIME_DIR", base)
+			t.Setenv("HOME", t.TempDir())
+			if _, err := createTransientServiceLogDir(true); err == nil {
+				t.Fatalf("PrivateTmp 不应把托管环境文件放入 %s", base)
+			}
+		})
 	}
 }
 
@@ -89,9 +160,11 @@ func TestStartCgroupIsolationFailsClosed(t *testing.T) {
 		name           string
 		privateNetwork bool
 		noNewPrivs     bool
+		privateTmp     bool
 	}{
 		{name: "private-network", privateNetwork: true},
 		{name: "no-new-privileges", noNewPrivs: true},
+		{name: "private-tmp", privateTmp: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			tmp := t.TempDir()
@@ -103,7 +176,7 @@ func TestStartCgroupIsolationFailsClosed(t *testing.T) {
 			t.Setenv("PATH", binDir)
 			t.Setenv("TMPDIR", tmp)
 
-			enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 0, test.privateNetwork, test.noNewPrivs, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
+			enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 0, test.privateNetwork, test.noNewPrivs, test.privateTmp, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
 			if err == nil || enforcer != nil {
 				t.Fatalf("隔离启动失败应返回错误而不降级: enforcer=%#v err=%v", enforcer, err)
 			}
@@ -130,7 +203,7 @@ func TestStartCgroupMemoryLimitKeepsMemoryFallback(t *testing.T) {
 	t.Setenv("PATH", binDir)
 	t.Setenv("TMPDIR", tmp)
 
-	enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 64*1024*1024, false, false, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
+	enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 64*1024*1024, false, false, false, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
 	if err != nil || enforcer != nil {
 		t.Fatalf("memory-only 失败应允许调用方回退 RSS: enforcer=%#v err=%v", enforcer, err)
 	}

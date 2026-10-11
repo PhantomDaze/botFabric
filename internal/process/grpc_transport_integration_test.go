@@ -3,6 +3,7 @@ package process
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -105,6 +106,108 @@ func TestGRPCTransportPrivateNetworkIsolation(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("未观察到网络隔离探测结果")
+}
+
+func TestGRPCTransportPrivateTmpRejectsSocketInPrivateDirectory(t *testing.T) {
+	for _, directory := range []string{"/tmp", "/var/tmp"} {
+		t.Run(directory, func(t *testing.T) {
+			transport, err := NewGRPCTransport(GRPCTransportConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest := processManifest()
+			manifest.Limits.PrivateTmp = true
+			socketPath := filepath.Join(directory, "botfabric-private-tmp-test", "plugin.sock")
+			err = transport.Start(context.Background(), manifest, socketPath)
+			if err == nil || !strings.Contains(err.Error(), "Unix Socket 不能位于") {
+				t.Fatalf("PrivateTmp 应在启动前拒绝临时目录中的 Socket: %v", err)
+			}
+			if _, statErr := os.Lstat(filepath.Dir(socketPath)); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("拒绝 Socket 路径前不应创建目录: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestGRPCTransportPrivateTmpIsolation(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("PrivateTmp 仅 Linux 支持")
+	}
+	var tmpMarker, varTmpMarker string
+	for _, directory := range []string{"/tmp", "/var/tmp"} {
+		marker, createErr := os.CreateTemp(directory, "botfabric-private-tmp-marker-")
+		if createErr != nil {
+			t.Skipf("无法在 %s 创建 PrivateTmp 探测标记: %v", directory, createErr)
+		}
+		if directory == "/tmp" {
+			tmpMarker = marker.Name()
+		} else {
+			varTmpMarker = marker.Name()
+		}
+		_ = marker.Close()
+		defer os.Remove(marker.Name())
+	}
+
+	logFile, err := os.CreateTemp(t.TempDir(), "private-tmp-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	logger := slog.New(slog.NewTextHandler(logFile, nil))
+	helperDirectory, err := os.MkdirTemp(os.Getenv("XDG_RUNTIME_DIR"), "botfabric-private-tmp-helper-")
+	if err != nil {
+		t.Skipf("无法在 XDG_RUNTIME_DIR 创建 PrivateTmp helper: %v", err)
+	}
+	defer os.RemoveAll(helperDirectory)
+	helper := buildProcessHelperInDir(t, helperDirectory)
+	transport, err := NewGRPCTransport(GRPCTransportConfig{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	manifest.Entry = helper
+	manifest.Limits.PrivateTmp = true
+	t.Setenv("BOTFABRIC_HELPER_PRIVATE_TMP_TMP_MARKER", tmpMarker)
+	t.Setenv("BOTFABRIC_HELPER_PRIVATE_TMP_VARTMP_MARKER", varTmpMarker)
+	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
+	socketDirectory, err := os.MkdirTemp("/dev/shm", "botfabric-private-tmp-socket-")
+	if err != nil {
+		t.Skipf("无法在 /dev/shm 创建私有 Socket 目录: %v", err)
+	}
+	defer os.RemoveAll(socketDirectory)
+	socketPath := filepath.Join(socketDirectory, fmt.Sprintf("plugin-%d.sock", os.Getpid()))
+	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
+		t.Skipf("PrivateTmp transient service 不可用: %v", err)
+	}
+	defer transport.Kill()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := transport.Connect(ctx, socketPath); err != nil {
+		content, _ := os.ReadFile(logFile.Name())
+		t.Fatalf("启用 PrivateTmp 后插件仍应连接 Unix Socket Session: %v; plugin logs: %s", err, content)
+	}
+	if err := transport.HandshakeWithCallbacks(ctx, manifest, session, SessionCallbacks{}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := logFile.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		content, err := os.ReadFile(logFile.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(content), "private tmp probe: isolated") {
+			return
+		}
+		if strings.Contains(string(content), "private tmp probe: exposed") || strings.Contains(string(content), "private tmp probe: unable-to-write") {
+			t.Fatalf("PrivateTmp 行为不符合预期: %s", content)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("未观察到 PrivateTmp 探测结果")
 }
 
 func TestGRPCTransportProcessSession(t *testing.T) {
@@ -325,12 +428,16 @@ func TestGRPCTransportRejectsInvalidSession(t *testing.T) {
 }
 
 func buildProcessHelper(t *testing.T) string {
+	return buildProcessHelperInDir(t, t.TempDir())
+}
+
+func buildProcessHelperInDir(t *testing.T, directory string) string {
 	t.Helper()
 	_, source, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("无法定位 process 测试源文件")
 	}
-	output := filepath.Join(t.TempDir(), "process-helper")
+	output := filepath.Join(directory, "process-helper")
 	command := exec.Command("go", "build", "-o", output, filepath.Join(filepath.Dir(source), "testdata", "helper"))
 	result, err := command.CombinedOutput()
 	if err != nil {

@@ -26,6 +26,7 @@ type manifestLimits struct {
 	Memory          string   `yaml:"memory"`
 	PrivateNetwork  bool     `yaml:"private_network"`
 	NoNewPrivileges bool     `yaml:"no_new_privileges"`
+	PrivateTmp      bool     `yaml:"private_tmp"`
 }
 
 type manifestRouting struct {
@@ -167,6 +168,7 @@ func LoadManifest(path string) (contract.Manifest, error) {
 			Memory:          raw.Limits.Memory,
 			PrivateNetwork:  raw.Limits.PrivateNetwork,
 			NoNewPrivileges: raw.Limits.NoNewPrivileges,
+			PrivateTmp:      raw.Limits.PrivateTmp,
 		},
 		Routing: convertRouting(raw.Routing),
 	}
@@ -193,11 +195,11 @@ func ValidateManifest(manifest contract.Manifest) error {
 	if manifest.Runtime == contract.RuntimeProcess && manifest.Limits.Memory == "" {
 		return fmt.Errorf("外部进程插件 %s 必须配置 memory", manifest.ID)
 	}
-	if (manifest.Limits.PrivateNetwork || manifest.Limits.NoNewPrivileges) && manifest.Runtime != contract.RuntimeProcess {
-		return fmt.Errorf("插件 %s 的 private_network/no_new_privileges 仅外部进程 runtime 支持", manifest.ID)
+	if (manifest.Limits.PrivateNetwork || manifest.Limits.NoNewPrivileges || manifest.Limits.PrivateTmp) && manifest.Runtime != contract.RuntimeProcess {
+		return fmt.Errorf("插件 %s 的 private_network/no_new_privileges/private_tmp 仅外部进程 runtime 支持", manifest.ID)
 	}
-	if (manifest.Limits.PrivateNetwork || manifest.Limits.NoNewPrivileges) && runtime.GOOS != "linux" {
-		return fmt.Errorf("插件 %s 的 private_network/no_new_privileges 仅在 Linux 平台支持", manifest.ID)
+	if (manifest.Limits.PrivateNetwork || manifest.Limits.NoNewPrivileges || manifest.Limits.PrivateTmp) && runtime.GOOS != "linux" {
+		return fmt.Errorf("插件 %s 的 private_network/no_new_privileges/private_tmp 仅在 Linux 平台支持", manifest.ID)
 	}
 	if manifest.Limits.Memory != "" {
 		if _, err := parseByteSize(manifest.Limits.Memory); err != nil {

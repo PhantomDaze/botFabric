@@ -9,8 +9,8 @@ import (
 )
 
 // startCgroupMemoryLimit 在非 Linux 平台不可用；显式请求隔离属性时拒绝启动。
-func startCgroupMemoryLimit(_ *exec.Cmd, _ int64, privateNetwork, noNewPrivileges bool, _ *slog.Logger, _ string) (*memoryEnforcer, error) {
-	if privateNetwork || noNewPrivileges {
+func startCgroupMemoryLimit(_ *exec.Cmd, _ int64, privateNetwork, noNewPrivileges, privateTmp bool, _ *slog.Logger, _ string) (*memoryEnforcer, error) {
+	if privateNetwork || noNewPrivileges || privateTmp {
 		return nil, errors.New("Linux systemd 进程隔离属性不可用")
 	}
 	return nil, nil

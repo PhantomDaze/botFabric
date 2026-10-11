@@ -84,6 +84,7 @@ type Limits struct {
 	Memory          string        `json:"memory" yaml:"memory"`
 	PrivateNetwork  bool          `json:"private_network" yaml:"private_network"`
 	NoNewPrivileges bool          `json:"no_new_privileges" yaml:"no_new_privileges"`
+	PrivateTmp      bool          `json:"private_tmp" yaml:"private_tmp"`
 }
 
 // HealthState 是插件的健康状态。
