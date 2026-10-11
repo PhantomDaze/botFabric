@@ -240,6 +240,169 @@ func TestRealLLMConfigValidatesEndpointAndEnvironment(t *testing.T) {
 	if _, err := RealLLMConfigFromEnv(func(string) string { return "" }); err == nil || strings.Contains(err.Error(), "key") {
 		t.Fatalf("缺少凭据时应提示变量名且不包含凭据，err = %v", err)
 	}
+	config, err = RealLLMConfigFromEnv(func(key string) string {
+		values := map[string]string{
+			RealLLMFormatEnv:   string(RealLLMFormatGoogleGemini),
+			RealLLMEndpointEnv: "https://generativelanguage.googleapis.com/v1beta",
+			RealLLMModelEnv:    "gemini-test",
+			RealLLMAPIKeyEnv:   "secret",
+		}
+		return values[key]
+	})
+	if err != nil || config.Format != RealLLMFormatGoogleGemini {
+		t.Fatalf("format env config = %#v, err = %v", config, err)
+	}
+}
+
+func TestRealLLMFormatsUseProtocolSpecificRequests(t *testing.T) {
+	classification := `{"dispatch_mode":"selective","targets":["app-b"]}`
+	tests := []struct {
+		name       string
+		format     RealLLMFormat
+		response   string
+		authHeader string
+		authValue  string
+		check      func(*testing.T, map[string]json.RawMessage)
+	}{
+		{
+			name:       "openai chat completions",
+			response:   `{"choices":[{"message":{"content":` + mustJSON(t, classification) + `}}]}`,
+			authHeader: "Authorization", authValue: "Bearer secret-test-key",
+			check: func(t *testing.T, body map[string]json.RawMessage) {
+				var format responseFormat
+				if err := json.Unmarshal(body["response_format"], &format); err != nil || format.Type != "json_object" {
+					t.Fatalf("response_format = %s, err = %v", body["response_format"], err)
+				}
+			},
+		},
+		{
+			name: "anthropic messages", format: RealLLMFormatAnthropicMessages,
+			response:   `{"content":[{"type":"text","text":` + mustJSON(t, classification) + `}]}`,
+			authHeader: "x-api-key", authValue: "secret-test-key",
+			check: func(t *testing.T, body map[string]json.RawMessage) {
+				var request anthropicMessagesRequest
+				if err := json.Unmarshal(mustMarshal(t, body), &request); err != nil {
+					t.Fatal(err)
+				}
+				if request.Model != "test-model" || request.MaxTokens != 128 || request.OutputConfig.Format.Type != "json_schema" || len(request.Messages) != 1 {
+					t.Fatalf("Anthropic request = %#v", request)
+				}
+			},
+		},
+		{
+			name: "openai responses", format: RealLLMFormatOpenAIResponses,
+			response:   `{"output":[{"type":"message","content":[{"type":"output_text","text":` + mustJSON(t, classification) + `}]}]}`,
+			authHeader: "Authorization", authValue: "Bearer secret-test-key",
+			check: func(t *testing.T, body map[string]json.RawMessage) {
+				var request openAIResponsesRequest
+				if err := json.Unmarshal(mustMarshal(t, body), &request); err != nil {
+					t.Fatal(err)
+				}
+				if request.Model != "test-model" || request.MaxOutputTokens != 128 || request.Text.Format.Type != "json_schema" || !request.Text.Format.Strict || request.Instructions == "" {
+					t.Fatalf("Responses request = %#v", request)
+				}
+			},
+		},
+		{
+			name: "google gemini", format: RealLLMFormatGoogleGemini,
+			response:   `{"candidates":[{"content":{"parts":[{"text":` + mustJSON(t, classification) + `}]}}]}`,
+			authHeader: "x-goog-api-key", authValue: "secret-test-key",
+			check: func(t *testing.T, body map[string]json.RawMessage) {
+				var request geminiGenerateContentRequest
+				if err := json.Unmarshal(mustMarshal(t, body), &request); err != nil {
+					t.Fatal(err)
+				}
+				if request.GenerationConfig.ResponseMIMEType != "application/json" || request.GenerationConfig.CandidateCount != 1 || request.GenerationConfig.ResponseSchema["type"] != "OBJECT" {
+					t.Fatalf("Gemini request = %#v", request)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if gotPath := r.URL.Path; test.format == RealLLMFormatGoogleGemini && gotPath != "/v1beta/models/test-model:generateContent" {
+					t.Errorf("Gemini path = %q", gotPath)
+				}
+				if got := r.Header.Get(test.authHeader); got != test.authValue {
+					t.Errorf("%s = %q", test.authHeader, got)
+				}
+				if test.format == RealLLMFormatAnthropicMessages && r.Header.Get("anthropic-version") != "2023-06-01" {
+					t.Errorf("anthropic-version = %q", r.Header.Get("anthropic-version"))
+				}
+				var body map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode request: %v", err)
+				}
+				test.check(t, body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, test.response)
+			}))
+			defer server.Close()
+			endpoint := server.URL
+			if test.format == RealLLMFormatGoogleGemini {
+				endpoint += "/v1beta"
+			}
+			classifier, err := NewRealLLMClassifier(RealLLMConfig{
+				Format: test.format, Endpoint: endpoint, Model: "test-model", APIKey: "secret-test-key",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := classifier.Classify(context.Background(), eventForClassification(t, "hello"), []string{"app-a", "app-b"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.Mode != contract.DispatchSelective || len(plan.Targets) != 1 || plan.Targets[0] != "app-b" {
+				t.Fatalf("plan = %#v", plan)
+			}
+		})
+	}
+}
+
+func TestRealLLMFormatDefaultsAndRejectsUnknown(t *testing.T) {
+	classifier, err := NewRealLLMClassifier(RealLLMConfig{Endpoint: "https://llm.example/v1/chat/completions", Model: "model", APIKey: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if classifier.format != RealLLMFormatOpenAIChatCompletions {
+		t.Fatalf("default format = %q", classifier.format)
+	}
+	if _, err := NewRealLLMClassifier(RealLLMConfig{Format: "unknown", Endpoint: "https://llm.example", Model: "model", APIKey: "key"}); err == nil {
+		t.Fatal("unknown format must be rejected")
+	}
+}
+
+func TestRealLLMEvaluationSet(t *testing.T) {
+	metrics, err := EvaluateClassifications([]EvaluationCase{
+		{Input: "help", Candidates: []string{"help", "chat"}, Expected: contract.DispatchPlan{Mode: contract.DispatchSelective, Targets: []string{"help"}}},
+		{Input: "talk", Candidates: []string{"help", "chat"}, Expected: contract.DispatchPlan{Mode: contract.DispatchBroadcast, Targets: []string{"help", "chat"}}},
+		{Input: "spam", Candidates: []string{"help", "chat"}, Expected: contract.DispatchPlan{Mode: contract.DispatchDrop, Drop: true}},
+	}, func(_ context.Context, input string, candidates []string) (contract.DispatchPlan, error) {
+		switch input {
+		case "help":
+			return contract.DispatchPlan{Mode: contract.DispatchSelective, Targets: []string{candidates[0]}}, nil
+		case "talk":
+			return contract.DispatchPlan{Mode: contract.DispatchBroadcast, Targets: candidates}, nil
+		default:
+			return contract.DispatchPlan{Mode: contract.DispatchDrop, Drop: true}, nil
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics.Total != 3 || metrics.ExactMatches != 3 || metrics.ExactAccuracy != 1 || metrics.ModeAccuracy != 1 || metrics.TargetPrecision != 1 || metrics.TargetRecall != 1 || metrics.Failures != 0 {
+		t.Fatalf("metrics = %#v", metrics)
+	}
+}
+
+func mustMarshal(t *testing.T, value any) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
 
 func mustJSON(t *testing.T, value string) string {
