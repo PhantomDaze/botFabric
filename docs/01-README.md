@@ -40,7 +40,7 @@ BotFabric 是位于 QQ 协议端与应用端之间的**完全插件化机器人�
 - 端点注册表与多协议端目标选择；
 - 可选跨协议端去重：message ID、指纹、auto，drop/forward，进程内存或 Redis 共享存储；
 - 路由规则：默认广播、正则过滤、selective/drop、优先级、fallback、公共 RouteClassifier 接口；
-- 可选 OpenAI-compatible Chat Completions 分类器插件：显式加载后使用环境变量密钥，失败时回退为候选广播；
+- 可选多协议真实 LLM 分类器：支持 OpenAI Chat Completions、Anthropic Messages、OpenAI Responses 和 Google Gemini `generateContent`，显式加载后使用环境变量密钥，失败时回退为候选广播；
 - 响应协调器：CandidateReply、first-wins、priority-override、幂等和指定机器人回复；
 - 四个路由预设：broadcast、regex、competition、required-bot；
 - 应用端 OneBot v11/v12：服务端等待应用连接、主动连接远端应用、事件推送和候选回复回收；
@@ -50,7 +50,7 @@ BotFabric 是位于 QQ 协议端与应用端之间的**完全插件化机器人�
 
 暂未完成或仅提供骨架：
 
-- LLM 分类器尚未覆盖真实供应商兼容矩阵和模型路由质量评估；
+- 真实 LLM 分类器现支持 OpenAI Chat Completions、Anthropic Messages、OpenAI Responses 和 Google Gemini `generateContent` 四种 API 格式，默认仍为 OpenAI Chat Completions；兼容性以具体格式及服务端 JSON 输出能力为准，尚不代表所有供应商/模型组合均验证通过。新增离线路由质量评估工具，仍需针对目标数据集和具体模型运行评估；
 - 高级沙箱仍有待完善；外部进程插件现支持 Linux opt-in 的 `private_network`、`no_new_privileges`、`private_tmp` 与固定 syscall 拒绝组，但尚无细粒度 egress allowlist、capability 白名单或其他平台的等价隔离；`Router.Plan` 已提供默认广播和规则匹配的 Go 性能基准，用于本机比较，不构成跨环境性能承诺。
 - 内存去重器 `Deduplicator.Check` 已提供消息 ID 与文本指纹新事件路径基准（`go test ./internal/dedup -run '^$' -bench '^BenchmarkDeduplicatorCheck' -benchmem`），仅作本机性能对比。
 
@@ -59,12 +59,13 @@ BotFabric 是位于 QQ 协议端与应用端之间的**完全插件化机器人�
 启用需将 `classifier.real-llm` 内置 manifest 放入 Runtime 插件目录；默认运行配置不加载该插件或请求模型。API Key 经密钥管理器注入，不要写入 Manifest 或日志：
 
 ```text
+BOTFABRIC_CLASSIFIER_REAL_LLM_FORMAT=openai_chat_completions # 可选，默认值
 BOTFABRIC_CLASSIFIER_REAL_LLM_ENDPOINT=https://api.example/v1/chat/completions
 BOTFABRIC_CLASSIFIER_REAL_LLM_MODEL=<model-name>
 BOTFABRIC_CLASSIFIER_REAL_LLM_API_KEY=<secret>
 ```
 
-启用后，匹配的群消息文本和候选应用 ID 会发送至配置的模型服务。分类器拒绝无效计划和候选外目标；网络失败或响应无效时 Router 回退为广播。完整清单与安全说明见 [03-开发指南.md](03-开发指南.md)。
+`BOTFABRIC_CLASSIFIER_REAL_LLM_FORMAT` 可设为 `openai_chat_completions`、`anthropic_messages`、`openai_responses` 或 `google_gemini`；endpoint 必须是对应 API 的完整 URL（Gemini 可使用 API root，由 model 构造请求路径）。启用后，匹配的群消息文本和候选应用 ID 会发送至配置的模型服务。分类器拒绝无效计划和候选外目标；网络失败或响应无效时 Router 回退为广播。四种协议有本地 stub 合约测试，但兼容性还取决于具体服务和模型是否支持相应 JSON 输出能力。离线评估数据集格式及运行方式见 [03-开发指南.md](03-开发指南.md)。
 
 
 | 文档 | 内容 |
