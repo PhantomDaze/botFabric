@@ -45,13 +45,13 @@ BotFabric 是位于 QQ 协议端与应用端之间的**完全插件化机器人�
 - 四个路由预设：broadcast、regex、competition、required-bot；
 - 应用端 OneBot v11/v12：服务端等待应用连接、主动连接远端应用、事件推送和候选回复回收；
 - Bearer Token 管理与诊断 API；
-- 外部进程插件的 Unix Socket 双向 gRPC Session、短期会话令牌、事件/服务双向通信和进程组回收；Linux 可通过 systemd transient service 使用 cgroup v2 限制整棵进程树的内存，并可按 Manifest 显式启用 PrivateNetwork 网络命名空间隔离宿主网络接口和宿主 loopback（插件自身 loopback 仍存在）；内存限制不可用时回退 RSS 监控，网络隔离不可用时拒绝启动；
+- 外部进程插件的 Unix Socket 双向 gRPC Session、短期会话令牌、事件/服务双向通信和进程组回收；Linux 可通过 systemd transient service 使用 cgroup v2 限制整棵进程树内存，并可按 Manifest 显式启用 PrivateNetwork 网络命名空间隔离或 NoNewPrivileges 提权防护；两项隔离请求均在宿主不支持时拒绝启动；
 - Go、Python 与 TypeScript 外部进程插件 SDK；
 
 暂未完成或仅提供骨架：
 
 - LLM 分类器尚未覆盖真实供应商兼容矩阵和模型路由质量评估；
-- 高级沙箱仍属于后续切片；外部进程插件现支持 Linux opt-in 的 `private_network` 网络命名空间隔离宿主网络接口和宿主 loopback（插件自身 loopback 仍存在），但尚无细粒度 egress allowlist、seccomp 或其他平台的等价隔离；`Router.Plan` 已提供默认广播和规则匹配的 Go 性能基准，用于本机比较，不构成跨环境性能承诺。
+- 高级沙箱仍属于后续切片；外部进程插件现支持 Linux opt-in 的 `private_network` 与 `no_new_privileges`，但尚无细粒度 egress allowlist、seccomp 或其他平台的等价隔离；`Router.Plan` 已提供默认广播和规则匹配的 Go 性能基准，用于本机比较，不构成跨环境性能承诺。
 - 内存去重器 `Deduplicator.Check` 已提供消息 ID 与文本指纹新事件路径基准（`go test ./internal/dedup -run '^$' -bench '^BenchmarkDeduplicatorCheck' -benchmem`），仅作本机性能对比。
 
 ## 真实 LLM 分类器
