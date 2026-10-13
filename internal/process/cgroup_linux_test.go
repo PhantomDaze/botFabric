@@ -28,7 +28,7 @@ func TestStartTransientServiceRequestsIsolationWithoutMemoryLimit(t *testing.T) 
 	t.Setenv("TMPDIR", tmp)
 
 	command := exec.Command("/bin/echo", "plugin-arg")
-	unit, pid, _, _, logDir, err := startTransientService(systemdRun, command, 0, true, true, true, false, nil)
+	unit, pid, _, _, logDir, err := startTransientService(systemdRun, command, 0, processIsolation{privateNetwork: true, noNewPrivileges: true, privateTmp: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestStartTransientServiceNoNewPrivilegesWithoutMemoryLimit(t *testing.T) {
 	t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
 	t.Setenv("TMPDIR", tmp)
 
-	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, true, false, false, nil)
+	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, processIsolation{noNewPrivileges: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestStartTransientServicePrivateTmpWithoutOtherIsolation(t *testing.T) {
 	t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
 	t.Setenv("TMPDIR", tmp)
 
-	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, false, true, false, nil)
+	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, processIsolation{privateTmp: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ printf '1\n'
 	t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
 	t.Setenv("TMPDIR", tmp)
 
-	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, false, false, true, nil)
+	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, processIsolation{restrictSyscalls: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ printf '1\n'
 			t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
 			t.Setenv("TMPDIR", tmp)
 
-			_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, false, false, false, test.set)
+			_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, processIsolation{capabilityBoundingSet: test.set})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -238,6 +238,45 @@ printf '1\n'
 				t.Fatalf("systemd-run capability 属性缺失: %q", args)
 			}
 		})
+	}
+}
+
+func TestStartTransientServiceRestrictsAddressFamilies(t *testing.T) {
+	tmp := t.TempDir()
+	binDir := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argsPath := filepath.Join(tmp, "args")
+	systemdRun := filepath.Join(binDir, "systemd-run")
+	writeExecutable(t, systemdRun, `#!/bin/sh
+printf '%s\n' "$@" > "$BOTFABRIC_TEST_ARGS"
+exit 0
+`)
+	writeExecutable(t, filepath.Join(binDir, "systemctl"), `#!/bin/sh
+printf '1\n'
+`)
+	t.Setenv("PATH", binDir)
+	t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
+	t.Setenv("TMPDIR", tmp)
+
+	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, processIsolation{restrictAddressFamilies: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(logDir)
+	content, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimSpace(string(content)), "\n")
+	if !containsAdjacent(args, "-p", "RestrictAddressFamilies=AF_UNIX") {
+		t.Fatalf("systemd-run 地址族限制属性缺失: %q", args)
+	}
+	for _, property := range []string{"PrivateNetwork=yes", "NoNewPrivileges=yes", "PrivateTmp=yes", "MemoryMax=0"} {
+		if containsAdjacent(args, "-p", property) {
+			t.Fatalf("地址族限制不应隐式启用 %s: %q", property, args)
+		}
 	}
 }
 
@@ -271,18 +310,15 @@ fi
 
 func TestStartCgroupIsolationFailsClosed(t *testing.T) {
 	for _, test := range []struct {
-		name                  string
-		privateNetwork        bool
-		noNewPrivs            bool
-		privateTmp            bool
-		restrictSyscalls      bool
-		capabilityBoundingSet []string
+		name      string
+		isolation processIsolation
 	}{
-		{name: "private-network", privateNetwork: true},
-		{name: "no-new-privileges", noNewPrivs: true},
-		{name: "private-tmp", privateTmp: true},
-		{name: "restrict-syscalls", restrictSyscalls: true},
-		{name: "capability-bounding-set", capabilityBoundingSet: []string{}},
+		{name: "private-network", isolation: processIsolation{privateNetwork: true}},
+		{name: "no-new-privileges", isolation: processIsolation{noNewPrivileges: true}},
+		{name: "private-tmp", isolation: processIsolation{privateTmp: true}},
+		{name: "restrict-syscalls", isolation: processIsolation{restrictSyscalls: true}},
+		{name: "restrict-address-families", isolation: processIsolation{restrictAddressFamilies: true}},
+		{name: "capability-bounding-set", isolation: processIsolation{capabilityBoundingSet: []string{}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			tmp := t.TempDir()
@@ -294,7 +330,7 @@ func TestStartCgroupIsolationFailsClosed(t *testing.T) {
 			t.Setenv("PATH", binDir)
 			t.Setenv("TMPDIR", tmp)
 
-			enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 0, test.privateNetwork, test.noNewPrivs, test.privateTmp, test.restrictSyscalls, test.capabilityBoundingSet, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
+			enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 0, test.isolation, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
 			if err == nil || enforcer != nil {
 				t.Fatalf("隔离启动失败应返回错误而不降级: enforcer=%#v err=%v", enforcer, err)
 			}
@@ -321,7 +357,7 @@ func TestStartCgroupMemoryLimitKeepsMemoryFallback(t *testing.T) {
 	t.Setenv("PATH", binDir)
 	t.Setenv("TMPDIR", tmp)
 
-	enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 64*1024*1024, false, false, false, false, nil, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
+	enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 64*1024*1024, processIsolation{}, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
 	if err != nil || enforcer != nil {
 		t.Fatalf("memory-only 失败应允许调用方回退 RSS: enforcer=%#v err=%v", enforcer, err)
 	}

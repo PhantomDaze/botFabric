@@ -72,6 +72,63 @@ func capabilityBoundingMask(t *testing.T, status []byte) string {
 	return mask
 }
 
+func TestGRPCTransportRestrictAddressFamiliesIsolation(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("地址族限制仅 Linux 支持")
+	}
+	logFile, err := os.CreateTemp(t.TempDir(), "restrict-address-families-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	logger := slog.New(slog.NewTextHandler(logFile, nil))
+	helper := buildProcessHelper(t)
+	transport, err := NewGRPCTransport(GRPCTransportConfig{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	manifest.Entry = helper
+	manifest.Limits.RestrictAddressFamilies = true
+	t.Setenv("BOTFABRIC_HELPER_PROBE_ADDRESS_FAMILY", "1")
+	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
+	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
+		t.Skipf("RestrictAddressFamilies transient service 不可用: %v", err)
+	}
+	defer transport.Kill()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// 地址族限制不能破坏插件的基本通信：Unix Socket Session 必须仍能建立。
+	if err := transport.Connect(ctx, socketPath); err != nil {
+		content, _ := os.ReadFile(logFile.Name())
+		t.Fatalf("限制地址族后插件仍应连接 Unix Socket Session: %v; plugin logs: %s", err, content)
+	}
+	if err := transport.HandshakeWithCallbacks(ctx, manifest, session, SessionCallbacks{}); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := logFile.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		content, err := os.ReadFile(logFile.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(content), "address family probe: blocked") {
+			return
+		}
+		if strings.Contains(string(content), "address family probe: allowed") {
+			t.Fatalf("地址族限制下插件仍可创建 TCP 套接字: %s", content)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("未观察到地址族探测结果")
+}
+
 func TestGRPCTransportPrivateNetworkIsolation(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("PrivateNetwork 仅 Linux 支持")

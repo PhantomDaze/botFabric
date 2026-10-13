@@ -112,6 +112,16 @@ func run() error {
 			fmt.Fprintln(os.Stderr, "private network probe: connected")
 		}
 	}
+	if os.Getenv("BOTFABRIC_HELPER_PROBE_ADDRESS_FAMILY") == "1" {
+		// 尝试直接创建 TCP 套接字：RestrictAddressFamilies=AF_UNIX 下应被内核拒绝。
+		conn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "address family probe: blocked: %v\n", err)
+		} else {
+			_ = conn.Close()
+			fmt.Fprintln(os.Stderr, "address family probe: allowed")
+		}
+	}
 	if marker := os.Getenv("BOTFABRIC_HELPER_PRIVATE_TMP_TMP_MARKER"); marker != "" {
 		_, tmpErr := os.Stat(marker)
 		varTmpMarker := os.Getenv("BOTFABRIC_HELPER_PRIVATE_TMP_VARTMP_MARKER")

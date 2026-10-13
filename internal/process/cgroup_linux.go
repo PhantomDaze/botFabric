@@ -25,27 +25,27 @@ const (
 )
 
 // startCgroupMemoryLimit 使用 systemd transient service 设置 cgroup v2 内存限制，
-// 并可按需启用 PrivateNetwork、NoNewPrivileges、PrivateTmp、capability bounding set 和系统调用过滤。隔离请求失败时返回错误，
+// 并可按需启用 PrivateNetwork、NoNewPrivileges、PrivateTmp、capability bounding set、
+// 地址族限制和系统调用过滤。隔离请求失败时返回错误，
 // 由调用方拒绝无隔离启动；只有内存限制失败时允许回退 RSS 监控。
-func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, privateNetwork, noNewPrivileges, privateTmp, restrictSyscalls bool, capabilityBoundingSet []string, logger *slog.Logger, pluginID string) (*memoryEnforcer, error) {
+func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, isolation processIsolation, logger *slog.Logger, pluginID string) (*memoryEnforcer, error) {
 	if command == nil {
 		return nil, errors.New("外部插件启动命令不能为空")
 	}
-	isolationRequested := privateNetwork || noNewPrivileges || privateTmp || restrictSyscalls || capabilityBoundingSet != nil
-	if bytes <= 0 && !isolationRequested {
+	if bytes <= 0 && !isolation.requested() {
 		return nil, nil
 	}
 	systemdRun, err := exec.LookPath("systemd-run")
 	if err != nil {
-		if isolationRequested {
+		if isolation.requested() {
 			return nil, fmt.Errorf("找不到 systemd-run: %w", err)
 		}
 		return nil, nil
 	}
 
-	unit, pid, stdoutPath, stderrPath, logDir, err := startTransientService(systemdRun, command, bytes, privateNetwork, noNewPrivileges, privateTmp, restrictSyscalls, capabilityBoundingSet)
+	unit, pid, stdoutPath, stderrPath, logDir, err := startTransientService(systemdRun, command, bytes, isolation)
 	if err != nil {
-		if isolationRequested {
+		if isolation.requested() {
 			return nil, err
 		}
 		logger.Warn("以 transient service 启动内存受限插件失败，回退 RSS 监控", "plugin_id", pluginID, "error", err)
@@ -64,7 +64,7 @@ func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, privateNetwork, noNe
 		_ = os.RemoveAll(logDir)
 	})
 
-	logger.Info("外部插件已启动 systemd 托管", "plugin_id", pluginID, "memory_max_bytes", bytes, "private_network", privateNetwork, "no_new_privileges", noNewPrivileges, "private_tmp", privateTmp, "restrict_syscalls", restrictSyscalls, "capability_bounding_set", capabilityBoundingSet, "unit", unit)
+	logger.Info("外部插件已启动 systemd 托管", "plugin_id", pluginID, "memory_max_bytes", bytes, "private_network", isolation.privateNetwork, "no_new_privileges", isolation.noNewPrivileges, "private_tmp", isolation.privateTmp, "restrict_syscalls", isolation.restrictSyscalls, "restrict_address_families", isolation.restrictAddressFamilies, "capability_bounding_set", isolation.capabilityBoundingSet, "unit", unit)
 	return &memoryEnforcer{
 		stop:    stopLogs,
 		managed: true,
@@ -76,8 +76,8 @@ func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, privateNetwork, noNe
 //
 // stdout/stderr 追加到普通文件并由 tailProcessLog 转发。环境变量通过权限为
 // 0600 的 EnvironmentFile 传递，避免 Session Token 出现在 systemd-run 参数中。
-func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int64, privateNetwork, noNewPrivileges, privateTmp, restrictSyscalls bool, capabilityBoundingSet []string) (unit string, pid int, stdoutPath, stderrPath, logDir string, err error) {
-	logDir, err = createTransientServiceLogDir(privateTmp)
+func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int64, isolation processIsolation) (unit string, pid int, stdoutPath, stderrPath, logDir string, err error) {
+	logDir, err = createTransientServiceLogDir(isolation.privateTmp)
 	if err != nil {
 		return "", 0, "", "", "", err
 	}
@@ -104,20 +104,22 @@ func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int
 			"-p", "OOMPolicy=continue",
 		)
 	}
-	if privateNetwork {
+	if isolation.privateNetwork {
 		args = append(args, "-p", "PrivateNetwork=yes")
 	}
-	if noNewPrivileges {
+	if isolation.noNewPrivileges {
 		args = append(args, "-p", "NoNewPrivileges=yes")
 	}
-	if privateTmp {
+	if isolation.privateTmp {
 		args = append(args, "-p", "PrivateTmp=yes")
 	}
-	if capabilityBoundingSet != nil {
-		value := strings.Join(capabilityBoundingSet, " ")
-		args = append(args, "-p", "CapabilityBoundingSet="+value)
+	if isolation.restrictAddressFamilies {
+		args = append(args, "-p", "RestrictAddressFamilies=AF_UNIX")
 	}
-	if restrictSyscalls {
+	if isolation.capabilityBoundingSet != nil {
+		args = append(args, "-p", "CapabilityBoundingSet="+strings.Join(isolation.capabilityBoundingSet, " "))
+	}
+	if isolation.restrictSyscalls {
 		args = append(args, "-p", "SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap @cpu-emulation")
 	}
 	args = append(args, "--", command.Path)

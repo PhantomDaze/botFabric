@@ -117,6 +117,35 @@ func (t *GRPCTransport) StartWithSession(ctx context.Context, manifest contract.
 	return t.start(ctx, manifest, socketPath, session)
 }
 
+// processIsolation 描述外部进程插件请求的 systemd 隔离属性，供平台相关启动
+// 路径构建 transient service 参数。
+type processIsolation struct {
+	privateNetwork          bool
+	noNewPrivileges         bool
+	privateTmp              bool
+	restrictSyscalls        bool
+	restrictAddressFamilies bool
+	capabilityBoundingSet   []string
+}
+
+// isolationFromManifest 从插件清单提取请求的隔离属性。
+func isolationFromManifest(manifest contract.Manifest) processIsolation {
+	return processIsolation{
+		privateNetwork:          manifest.Limits.PrivateNetwork,
+		noNewPrivileges:         manifest.Limits.NoNewPrivileges,
+		privateTmp:              manifest.Limits.PrivateTmp,
+		restrictSyscalls:        manifest.Limits.RestrictSyscalls,
+		restrictAddressFamilies: manifest.Limits.RestrictAddressFamilies,
+		capabilityBoundingSet:   manifest.Limits.CapabilityBoundingSet,
+	}
+}
+
+// requested 报告是否请求了任何隔离属性；请求时启动必须走 systemd 且失败不降级。
+func (o processIsolation) requested() bool {
+	return o.privateNetwork || o.noNewPrivileges || o.privateTmp ||
+		o.restrictSyscalls || o.restrictAddressFamilies || o.capabilityBoundingSet != nil
+}
+
 func (t *GRPCTransport) start(ctx context.Context, manifest contract.Manifest, socketPath string, session Session) error {
 	t.startMu.Lock()
 	defer t.startMu.Unlock()
@@ -211,7 +240,7 @@ func (t *GRPCTransport) start(ctx context.Context, manifest contract.Manifest, s
 	// 请求任何隔离属性时都必须使用 systemd transient service；失败时不降级。
 	// 仅 memory 限制在 cgroup 不可用时回退 RSS 轮询（只覆盖直接子进程）。
 	limit := memoryLimitBytes(manifest)
-	enforcer, err := startCgroupMemoryLimit(command, limit, manifest.Limits.PrivateNetwork, manifest.Limits.NoNewPrivileges, manifest.Limits.PrivateTmp, manifest.Limits.RestrictSyscalls, manifest.Limits.CapabilityBoundingSet, t.config.Logger, manifest.ID)
+	enforcer, err := startCgroupMemoryLimit(command, limit, isolationFromManifest(manifest), t.config.Logger, manifest.ID)
 	if err != nil {
 		_ = t.cleanup()
 		t.closeProcessDone()

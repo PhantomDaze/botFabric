@@ -151,6 +151,7 @@ limits:
   no_new_privileges: true
   private_tmp: true
   restrict_syscalls: true
+  restrict_address_families: true
 `
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -159,7 +160,7 @@ limits:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !manifest.Limits.PrivateNetwork || !manifest.Limits.NoNewPrivileges || !manifest.Limits.PrivateTmp || !manifest.Limits.RestrictSyscalls {
+	if !manifest.Limits.PrivateNetwork || !manifest.Limits.NoNewPrivileges || !manifest.Limits.PrivateTmp || !manifest.Limits.RestrictSyscalls || !manifest.Limits.RestrictAddressFamilies {
 		t.Fatalf("隔离限制未解析: %#v", manifest.Limits)
 	}
 }
@@ -201,6 +202,7 @@ func TestValidateManifestRejectsIsolationOnUnsupportedPlatform(t *testing.T) {
 		{Timeout: 1, Memory: "64MiB", NoNewPrivileges: true},
 		{Timeout: 1, Memory: "64MiB", PrivateTmp: true},
 		{Timeout: 1, Memory: "64MiB", RestrictSyscalls: true},
+		{Timeout: 1, Memory: "64MiB", RestrictAddressFamilies: true},
 		{Timeout: 1, Memory: "64MiB", CapabilityBoundingSet: []string{}},
 	} {
 		manifest := contract.Manifest{
@@ -256,6 +258,34 @@ func TestValidateManifestRejectsRestrictSyscallsForInProcess(t *testing.T) {
 	}
 	if err := ValidateManifest(manifest); err == nil {
 		t.Fatal("in_process 插件不应声明 restrict_syscalls")
+	}
+}
+
+func TestValidateManifestRestrictAddressFamilies(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		runtime   contract.PluginRuntime
+		memory    string
+		requested bool
+		wantValid bool
+	}{
+		{name: "process", runtime: contract.RuntimeProcess, memory: "64MiB", requested: true, wantValid: true},
+		{name: "in-process", runtime: contract.RuntimeInProcess, requested: true},
+		{name: "not-requested", runtime: contract.RuntimeProcess, memory: "64MiB", wantValid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := contract.Manifest{
+				ID:      "process.address-families",
+				Name:    "Process Address Families",
+				Version: "0.1.0",
+				Runtime: test.runtime,
+				Entry:   "./plugin",
+				Limits:  contract.Limits{Timeout: 1, Memory: test.memory, RestrictAddressFamilies: test.requested},
+			}
+			if err := ValidateManifest(manifest); (err == nil) != test.wantValid {
+				t.Fatalf("ValidateManifest() error = %v, wantValid %v", err, test.wantValid)
+			}
+		})
 	}
 }
 

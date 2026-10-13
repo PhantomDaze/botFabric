@@ -23,13 +23,14 @@ type manifestFile struct {
 }
 
 type manifestLimits struct {
-	Timeout               Duration `yaml:"timeout"`
-	Memory                string   `yaml:"memory"`
-	PrivateNetwork        bool     `yaml:"private_network"`
-	NoNewPrivileges       bool     `yaml:"no_new_privileges"`
-	PrivateTmp            bool     `yaml:"private_tmp"`
-	RestrictSyscalls      bool     `yaml:"restrict_syscalls"`
-	CapabilityBoundingSet []string `yaml:"capability_bounding_set"`
+	Timeout                 Duration `yaml:"timeout"`
+	Memory                  string   `yaml:"memory"`
+	PrivateNetwork          bool     `yaml:"private_network"`
+	NoNewPrivileges         bool     `yaml:"no_new_privileges"`
+	PrivateTmp              bool     `yaml:"private_tmp"`
+	RestrictSyscalls        bool     `yaml:"restrict_syscalls"`
+	RestrictAddressFamilies bool     `yaml:"restrict_address_families"`
+	CapabilityBoundingSet   []string `yaml:"capability_bounding_set"`
 }
 
 type manifestRouting struct {
@@ -167,13 +168,14 @@ func LoadManifest(path string) (contract.Manifest, error) {
 		Provides: raw.Provides,
 		Requires: raw.Requires,
 		Limits: contract.Limits{
-			Timeout:               raw.Limits.Timeout.Duration,
-			Memory:                raw.Limits.Memory,
-			PrivateNetwork:        raw.Limits.PrivateNetwork,
-			NoNewPrivileges:       raw.Limits.NoNewPrivileges,
-			PrivateTmp:            raw.Limits.PrivateTmp,
-			RestrictSyscalls:      raw.Limits.RestrictSyscalls,
-			CapabilityBoundingSet: raw.Limits.CapabilityBoundingSet,
+			Timeout:                 raw.Limits.Timeout.Duration,
+			Memory:                  raw.Limits.Memory,
+			PrivateNetwork:          raw.Limits.PrivateNetwork,
+			NoNewPrivileges:         raw.Limits.NoNewPrivileges,
+			PrivateTmp:              raw.Limits.PrivateTmp,
+			RestrictSyscalls:        raw.Limits.RestrictSyscalls,
+			RestrictAddressFamilies: raw.Limits.RestrictAddressFamilies,
+			CapabilityBoundingSet:   raw.Limits.CapabilityBoundingSet,
 		},
 		Routing: convertRouting(raw.Routing),
 	}
@@ -200,10 +202,10 @@ func ValidateManifest(manifest contract.Manifest) error {
 	if manifest.Runtime == contract.RuntimeProcess && manifest.Limits.Memory == "" {
 		return fmt.Errorf("外部进程插件 %s 必须配置 memory", manifest.ID)
 	}
-	if (manifest.Limits.PrivateNetwork || manifest.Limits.NoNewPrivileges || manifest.Limits.PrivateTmp || manifest.Limits.RestrictSyscalls || manifest.Limits.CapabilityBoundingSet != nil) && manifest.Runtime != contract.RuntimeProcess {
+	if requestsProcessIsolation(manifest.Limits) && manifest.Runtime != contract.RuntimeProcess {
 		return fmt.Errorf("插件 %s 的隔离 limits 仅外部进程 runtime 支持", manifest.ID)
 	}
-	if (manifest.Limits.PrivateNetwork || manifest.Limits.NoNewPrivileges || manifest.Limits.PrivateTmp || manifest.Limits.RestrictSyscalls || manifest.Limits.CapabilityBoundingSet != nil) && runtime.GOOS != "linux" {
+	if requestsProcessIsolation(manifest.Limits) && runtime.GOOS != "linux" {
 		return fmt.Errorf("插件 %s 的隔离 limits 仅在 Linux 平台支持", manifest.ID)
 	}
 	if err := validateCapabilityBoundingSet(manifest.Limits.CapabilityBoundingSet); err != nil {
@@ -230,6 +232,11 @@ func ValidateManifest(manifest contract.Manifest) error {
 		return fmt.Errorf("插件 %s: %w", manifest.ID, err)
 	}
 	return nil
+}
+
+func requestsProcessIsolation(limits contract.Limits) bool {
+	return limits.PrivateNetwork || limits.NoNewPrivileges || limits.PrivateTmp ||
+		limits.RestrictSyscalls || limits.RestrictAddressFamilies || limits.CapabilityBoundingSet != nil
 }
 
 func validateCapabilityBoundingSet(capabilities []string) error {
