@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStartTransientServiceRequestsIsolationWithoutMemoryLimit(t *testing.T) {
@@ -27,7 +28,7 @@ func TestStartTransientServiceRequestsIsolationWithoutMemoryLimit(t *testing.T) 
 	t.Setenv("TMPDIR", tmp)
 
 	command := exec.Command("/bin/echo", "plugin-arg")
-	unit, pid, _, _, logDir, err := startTransientService(systemdRun, command, 0, true, true, true, false)
+	unit, pid, _, _, logDir, err := startTransientService(systemdRun, command, 0, true, true, true, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +67,7 @@ func TestStartTransientServiceNoNewPrivilegesWithoutMemoryLimit(t *testing.T) {
 	t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
 	t.Setenv("TMPDIR", tmp)
 
-	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, true, false, false)
+	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, true, false, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +100,7 @@ func TestStartTransientServicePrivateTmpWithoutOtherIsolation(t *testing.T) {
 	t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
 	t.Setenv("TMPDIR", tmp)
 
-	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, false, true, false)
+	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, false, true, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +175,7 @@ printf '1\n'
 	t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
 	t.Setenv("TMPDIR", tmp)
 
-	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, false, false, true)
+	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, false, false, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,18 +195,94 @@ printf '1\n'
 	}
 }
 
+func TestStartTransientServiceCapabilityBoundingSet(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		set   []string
+		value string
+	}{
+		{name: "allow-list", set: []string{"CAP_SYS_ADMIN", "CAP_NET_BIND_SERVICE"}, value: "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_BIND_SERVICE"},
+		{name: "empty", set: []string{}, value: "CapabilityBoundingSet="},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			binDir := filepath.Join(tmp, "bin")
+			if err := os.Mkdir(binDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			argsPath := filepath.Join(tmp, "args")
+			systemdRun := filepath.Join(binDir, "systemd-run")
+			systemctl := filepath.Join(binDir, "systemctl")
+			writeExecutable(t, systemdRun, `#!/bin/sh
+printf '%s\n' "$@" > "$BOTFABRIC_TEST_ARGS"
+exit 0
+`)
+			writeExecutable(t, systemctl, `#!/bin/sh
+printf '1\n'
+`)
+			t.Setenv("PATH", binDir)
+			t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
+			t.Setenv("TMPDIR", tmp)
+
+			_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, false, false, false, false, test.set)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(logDir)
+			content, err := os.ReadFile(argsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			args := strings.Split(strings.TrimSpace(string(content)), "\n")
+			if !containsAdjacent(args, "-p", test.value) {
+				t.Fatalf("systemd-run capability 属性缺失: %q", args)
+			}
+		})
+	}
+}
+
+func TestWaitServiceMainPIDWaitsForProcessAfterTransientUnitCreated(t *testing.T) {
+	tmp := t.TempDir()
+	binDir := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	firstCallPath := filepath.Join(tmp, "first-call")
+	systemctl := filepath.Join(binDir, "systemctl")
+	writeExecutable(t, systemctl, `#!/bin/sh
+if [ ! -e "$BOTFABRIC_TEST_FIRST_CALL" ]; then
+  : > "$BOTFABRIC_TEST_FIRST_CALL"
+  printf '123456\n'
+else
+  printf '0\n'
+fi
+`)
+	t.Setenv("PATH", binDir)
+	t.Setenv("BOTFABRIC_TEST_FIRST_CALL", firstCallPath)
+
+	start := time.Now()
+	if _, err := waitServiceMainPID("test", 60*time.Millisecond); err == nil {
+		t.Fatal("不存在的 transient service PID 不应被接受")
+	}
+	if time.Since(start) < 40*time.Millisecond {
+		t.Fatal("等待逻辑应继续轮询，直到主进程启动或超时")
+	}
+}
+
 func TestStartCgroupIsolationFailsClosed(t *testing.T) {
 	for _, test := range []struct {
-		name             string
-		privateNetwork   bool
-		noNewPrivs       bool
-		privateTmp       bool
-		restrictSyscalls bool
+		name                  string
+		privateNetwork        bool
+		noNewPrivs            bool
+		privateTmp            bool
+		restrictSyscalls      bool
+		capabilityBoundingSet []string
 	}{
 		{name: "private-network", privateNetwork: true},
 		{name: "no-new-privileges", noNewPrivs: true},
 		{name: "private-tmp", privateTmp: true},
 		{name: "restrict-syscalls", restrictSyscalls: true},
+		{name: "capability-bounding-set", capabilityBoundingSet: []string{}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			tmp := t.TempDir()
@@ -217,7 +294,7 @@ func TestStartCgroupIsolationFailsClosed(t *testing.T) {
 			t.Setenv("PATH", binDir)
 			t.Setenv("TMPDIR", tmp)
 
-			enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 0, test.privateNetwork, test.noNewPrivs, test.privateTmp, test.restrictSyscalls, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
+			enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 0, test.privateNetwork, test.noNewPrivs, test.privateTmp, test.restrictSyscalls, test.capabilityBoundingSet, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
 			if err == nil || enforcer != nil {
 				t.Fatalf("隔离启动失败应返回错误而不降级: enforcer=%#v err=%v", enforcer, err)
 			}
@@ -244,7 +321,7 @@ func TestStartCgroupMemoryLimitKeepsMemoryFallback(t *testing.T) {
 	t.Setenv("PATH", binDir)
 	t.Setenv("TMPDIR", tmp)
 
-	enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 64*1024*1024, false, false, false, false, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
+	enforcer, err := startCgroupMemoryLimit(exec.Command("/bin/true"), 64*1024*1024, false, false, false, false, nil, slog.New(slog.NewTextHandler(os.Stderr, nil)), "test.plugin")
 	if err != nil || enforcer != nil {
 		t.Fatalf("memory-only 失败应允许调用方回退 RSS: enforcer=%#v err=%v", enforcer, err)
 	}

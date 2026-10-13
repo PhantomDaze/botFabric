@@ -45,13 +45,13 @@ BotFabric 是位于 QQ 协议端与应用端之间的**完全插件化机器人�
 - 四个路由预设：broadcast、regex、competition、required-bot；
 - 应用端 OneBot v11/v12：服务端等待应用连接、主动连接远端应用、事件推送和候选回复回收；
 - Bearer Token 管理与诊断 API；
-- 外部进程插件的 Unix Socket 双向 gRPC Session、短期会话令牌、事件/服务双向通信和进程组回收；Linux 可通过 systemd transient service 使用 cgroup v2 限制整棵进程树内存，并可按 Manifest 显式启用 PrivateNetwork 网络命名空间隔离、NoNewPrivileges 提权防护或 PrivateTmp 临时目录隔离；隔离请求均在宿主不支持时拒绝启动；
+- 外部进程插件的 Unix Socket 双向 gRPC Session、短期会话令牌、事件/服务双向通信和进程组回收；Linux 可通过 systemd transient service 使用 cgroup v2 限制整棵进程树内存，并可按 Manifest 显式启用 PrivateNetwork 网络命名空间隔离、NoNewPrivileges 提权防护、PrivateTmp 临时目录隔离、固定 syscall 拒绝组和 capability bounding set 限制；隔离请求均在宿主不支持时拒绝启动；
 - Go、Python 与 TypeScript 外部进程插件 SDK；
 
 暂未完成或仅提供骨架：
 
 - 真实 LLM 分类器现支持 OpenAI Chat Completions、Anthropic Messages、OpenAI Responses 和 Google Gemini `generateContent` 四种 API 格式，默认仍为 OpenAI Chat Completions；兼容性以具体格式及服务端 JSON 输出能力为准，尚不代表所有供应商/模型组合均验证通过。新增离线路由质量评估工具，仍需针对目标数据集和具体模型运行评估；
-- 高级沙箱仍有待完善；外部进程插件现支持 Linux opt-in 的 `private_network`、`no_new_privileges`、`private_tmp` 与固定 syscall 拒绝组，但尚无细粒度 egress allowlist、capability 白名单或其他平台的等价隔离；`Router.Plan` 已提供默认广播和规则匹配的 Go 性能基准，用于本机比较，不构成跨环境性能承诺。
+- 高级沙箱仍有待完善；外部进程插件现支持 Linux opt-in 的 `private_network`、`no_new_privileges`、`private_tmp`、固定 syscall 拒绝组和 `capability_bounding_set`，但 user systemd manager 只有在 user namespace 等宿主能力可用时才能应用 capability 限制；尚无细粒度 egress allowlist 或其他平台的等价隔离；`Router.Plan` 已提供默认广播和规则匹配的 Go 性能基准，用于本机比较，不构成跨环境性能承诺。
 - 内存去重器 `Deduplicator.Check` 已提供消息 ID 与文本指纹新事件路径基准（`go test ./internal/dedup -run '^$' -bench '^BenchmarkDeduplicatorCheck' -benchmem`），仅作本机性能对比。
 
 ## 真实 LLM 分类器

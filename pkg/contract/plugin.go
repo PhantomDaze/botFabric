@@ -80,12 +80,13 @@ type Requires struct {
 
 // Limits 描述运行时对插件施加的资源与调用限制。
 type Limits struct {
-	Timeout          time.Duration `json:"timeout" yaml:"-"`
-	Memory           string        `json:"memory" yaml:"memory"`
-	PrivateNetwork   bool          `json:"private_network" yaml:"private_network"`
-	NoNewPrivileges  bool          `json:"no_new_privileges" yaml:"no_new_privileges"`
-	PrivateTmp       bool          `json:"private_tmp" yaml:"private_tmp"`
-	RestrictSyscalls bool          `json:"restrict_syscalls" yaml:"restrict_syscalls"`
+	Timeout               time.Duration `json:"timeout" yaml:"-"`
+	Memory                string        `json:"memory" yaml:"memory"`
+	PrivateNetwork        bool          `json:"private_network" yaml:"private_network"`
+	NoNewPrivileges       bool          `json:"no_new_privileges" yaml:"no_new_privileges"`
+	PrivateTmp            bool          `json:"private_tmp" yaml:"private_tmp"`
+	RestrictSyscalls      bool          `json:"restrict_syscalls" yaml:"restrict_syscalls"`
+	CapabilityBoundingSet []string      `json:"capability_bounding_set,omitempty" yaml:"capability_bounding_set,omitempty"`
 }
 
 // HealthState 是插件的健康状态。

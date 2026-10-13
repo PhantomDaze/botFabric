@@ -25,23 +25,27 @@ const (
 )
 
 // startCgroupMemoryLimit 使用 systemd transient service 设置 cgroup v2 内存限制，
-// 并可按需启用 PrivateNetwork、NoNewPrivileges、PrivateTmp 和系统调用过滤。隔离请求失败时返回错误，
+// 并可按需启用 PrivateNetwork、NoNewPrivileges、PrivateTmp、capability bounding set 和系统调用过滤。隔离请求失败时返回错误，
 // 由调用方拒绝无隔离启动；只有内存限制失败时允许回退 RSS 监控。
-func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, privateNetwork, noNewPrivileges, privateTmp, restrictSyscalls bool, logger *slog.Logger, pluginID string) (*memoryEnforcer, error) {
-	if command == nil || (bytes <= 0 && !privateNetwork && !noNewPrivileges && !privateTmp && !restrictSyscalls) {
+func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, privateNetwork, noNewPrivileges, privateTmp, restrictSyscalls bool, capabilityBoundingSet []string, logger *slog.Logger, pluginID string) (*memoryEnforcer, error) {
+	if command == nil {
+		return nil, errors.New("外部插件启动命令不能为空")
+	}
+	isolationRequested := privateNetwork || noNewPrivileges || privateTmp || restrictSyscalls || capabilityBoundingSet != nil
+	if bytes <= 0 && !isolationRequested {
 		return nil, nil
 	}
 	systemdRun, err := exec.LookPath("systemd-run")
 	if err != nil {
-		if privateNetwork || noNewPrivileges || privateTmp || restrictSyscalls {
+		if isolationRequested {
 			return nil, fmt.Errorf("找不到 systemd-run: %w", err)
 		}
 		return nil, nil
 	}
 
-	unit, pid, stdoutPath, stderrPath, logDir, err := startTransientService(systemdRun, command, bytes, privateNetwork, noNewPrivileges, privateTmp, restrictSyscalls)
+	unit, pid, stdoutPath, stderrPath, logDir, err := startTransientService(systemdRun, command, bytes, privateNetwork, noNewPrivileges, privateTmp, restrictSyscalls, capabilityBoundingSet)
 	if err != nil {
-		if privateNetwork || noNewPrivileges || privateTmp || restrictSyscalls {
+		if isolationRequested {
 			return nil, err
 		}
 		logger.Warn("以 transient service 启动内存受限插件失败，回退 RSS 监控", "plugin_id", pluginID, "error", err)
@@ -60,7 +64,7 @@ func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, privateNetwork, noNe
 		_ = os.RemoveAll(logDir)
 	})
 
-	logger.Info("外部插件已启动 systemd 托管", "plugin_id", pluginID, "memory_max_bytes", bytes, "private_network", privateNetwork, "no_new_privileges", noNewPrivileges, "private_tmp", privateTmp, "restrict_syscalls", restrictSyscalls, "unit", unit)
+	logger.Info("外部插件已启动 systemd 托管", "plugin_id", pluginID, "memory_max_bytes", bytes, "private_network", privateNetwork, "no_new_privileges", noNewPrivileges, "private_tmp", privateTmp, "restrict_syscalls", restrictSyscalls, "capability_bounding_set", capabilityBoundingSet, "unit", unit)
 	return &memoryEnforcer{
 		stop:    stopLogs,
 		managed: true,
@@ -72,7 +76,7 @@ func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, privateNetwork, noNe
 //
 // stdout/stderr 追加到普通文件并由 tailProcessLog 转发。环境变量通过权限为
 // 0600 的 EnvironmentFile 传递，避免 Session Token 出现在 systemd-run 参数中。
-func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int64, privateNetwork, noNewPrivileges, privateTmp, restrictSyscalls bool) (unit string, pid int, stdoutPath, stderrPath, logDir string, err error) {
+func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int64, privateNetwork, noNewPrivileges, privateTmp, restrictSyscalls bool, capabilityBoundingSet []string) (unit string, pid int, stdoutPath, stderrPath, logDir string, err error) {
 	logDir, err = createTransientServiceLogDir(privateTmp)
 	if err != nil {
 		return "", 0, "", "", "", err
@@ -108,6 +112,10 @@ func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int
 	}
 	if privateTmp {
 		args = append(args, "-p", "PrivateTmp=yes")
+	}
+	if capabilityBoundingSet != nil {
+		value := strings.Join(capabilityBoundingSet, " ")
+		args = append(args, "-p", "CapabilityBoundingSet="+value)
 	}
 	if restrictSyscalls {
 		args = append(args, "-p", "SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap @cpu-emulation")
@@ -317,7 +325,9 @@ func waitServiceMainPID(unit string, timeout time.Duration) (int, error) {
 		out, err := exec.Command("systemctl", "--user", "show", "-p", "MainPID", "--value", unit+".service").Output()
 		if err == nil {
 			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(out))); convErr == nil && pid > 0 {
-				return pid, nil
+				if processErr := syscall.Kill(pid, 0); processErr == nil || errors.Is(processErr, syscall.EPERM) {
+					return pid, nil
+				}
 			}
 		}
 		time.Sleep(20 * time.Millisecond)

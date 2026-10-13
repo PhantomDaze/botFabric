@@ -61,7 +61,7 @@ func (l *BuiltinLoader) Load(manifest contract.Manifest, _ contract.Host) (contr
 
 func manifestsEqual(left, right contract.Manifest) bool {
 	if left.ID != right.ID || left.Name != right.Name || left.Version != right.Version ||
-		left.Runtime != right.Runtime || left.Entry != right.Entry || left.Limits != right.Limits {
+		left.Runtime != right.Runtime || left.Entry != right.Entry || !reflect.DeepEqual(left.Limits, right.Limits) {
 		return false
 	}
 	if !reflect.DeepEqual(left.Routing, right.Routing) {

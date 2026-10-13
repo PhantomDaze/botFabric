@@ -3,11 +3,79 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 
 	"github.com/PhantomDaze/botfabric/pkg/contract"
 )
+
+func TestValidateCapabilityBoundingSet(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		values    []string
+		wantValid bool
+	}{
+		{name: "valid", values: []string{"CAP_SYS_ADMIN", "CAP_NET_BIND_SERVICE"}, wantValid: true},
+		{name: "explicit-empty", values: []string{}, wantValid: true},
+		{name: "empty-name", values: []string{""}},
+		{name: "missing-prefix", values: []string{"SYS_ADMIN"}},
+		{name: "invalid-character", values: []string{"CAP_SYS-ADMIN"}},
+		{name: "duplicate", values: []string{"CAP_SYS_ADMIN", "CAP_SYS_ADMIN"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := contract.Manifest{ID: "process.capabilities", Name: "Process Capabilities", Version: "0.1.0", Runtime: contract.RuntimeProcess, Entry: "./plugin", Limits: contract.Limits{Timeout: 1, Memory: "64MiB", CapabilityBoundingSet: test.values}}
+			if err := ValidateManifest(manifest); (err == nil) != test.wantValid {
+				t.Fatalf("ValidateManifest() error = %v, wantValid %v", err, test.wantValid)
+			}
+		})
+	}
+}
+
+func TestValidateManifestRejectsCapabilityBoundingSetForInProcess(t *testing.T) {
+	manifest := contract.Manifest{ID: "inprocess.capabilities", Name: "In-process Capabilities", Version: "0.1.0", Runtime: contract.RuntimeInProcess, Entry: "builtin.example", Limits: contract.Limits{Timeout: 1, CapabilityBoundingSet: []string{}}}
+	if err := ValidateManifest(manifest); err == nil {
+		t.Fatal("in_process 插件不应声明 capability_bounding_set")
+	}
+}
+
+func TestValidateManifestRejectsCapabilityBoundingSetOnUnsupportedPlatform(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("Linux 支持 capability_bounding_set")
+	}
+	manifest := contract.Manifest{ID: "process.capabilities", Name: "Process Capabilities", Version: "0.1.0", Runtime: contract.RuntimeProcess, Entry: "./plugin", Limits: contract.Limits{Timeout: 1, Memory: "64MiB", CapabilityBoundingSet: []string{"CAP_SYS_ADMIN"}}}
+	if err := ValidateManifest(manifest); err == nil {
+		t.Fatal("非 Linux 平台不应接受 capability_bounding_set")
+	}
+}
+
+func TestLoadManifestCapabilityBoundingSet(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		field            string
+		wantCapabilities []string
+	}{
+		{name: "omitted", wantCapabilities: nil},
+		{name: "empty", field: "  capability_bounding_set: []\n", wantCapabilities: []string{}},
+		{name: "configured", field: "  capability_bounding_set: [CAP_SYS_ADMIN, CAP_NET_BIND_SERVICE]\n", wantCapabilities: []string{"CAP_SYS_ADMIN", "CAP_NET_BIND_SERVICE"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "manifest.yaml")
+			content := "id: process.capabilities\nname: Process Capabilities\nversion: 0.1.0\nruntime: process\nentry: ./plugin\nprovides:\n  services: []\n  subscriptions: []\nrequires:\n  services: []\n  permissions: []\nlimits:\n  timeout: 2s\n  memory: 64MiB\n" + test.field
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			manifest, err := LoadManifest(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			actual := manifest.Limits.CapabilityBoundingSet
+			if !reflect.DeepEqual(actual, test.wantCapabilities) {
+				t.Fatalf("CapabilityBoundingSet = %#v, want %#v", actual, test.wantCapabilities)
+			}
+		})
+	}
+}
 
 func TestLoadManifestRouting(t *testing.T) {
 	directory := t.TempDir()
@@ -133,6 +201,7 @@ func TestValidateManifestRejectsIsolationOnUnsupportedPlatform(t *testing.T) {
 		{Timeout: 1, Memory: "64MiB", NoNewPrivileges: true},
 		{Timeout: 1, Memory: "64MiB", PrivateTmp: true},
 		{Timeout: 1, Memory: "64MiB", RestrictSyscalls: true},
+		{Timeout: 1, Memory: "64MiB", CapabilityBoundingSet: []string{}},
 	} {
 		manifest := contract.Manifest{
 			ID:      "process.isolation",

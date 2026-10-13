@@ -32,6 +32,46 @@ func (integrationAllowPolicy) AllowSubscribe(string, string) bool      { return 
 func (integrationAllowPolicy) AllowInvoke(string, string, string) bool { return true }
 func (integrationAllowPolicy) AllowProvide(string, string) bool        { return true }
 
+func TestGRPCTransportCapabilityBoundingSetIsolation(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("capability bounding set 仅 Linux 支持")
+	}
+	baselineStatus, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capabilityBoundingMask(t, baselineStatus) == "0" {
+		t.Skip("宿主进程 capability bounding set 已为空，无法验证收窄")
+	}
+	systemdRun, err := exec.LookPath("systemd-run")
+	if err != nil {
+		t.Skipf("systemd-run 不可用: %v", err)
+	}
+	output, err := exec.Command(systemdRun, "--user", "--wait", "--collect", "--pipe", "-p", "CapabilityBoundingSet=CAP_NET_BIND_SERVICE", "/bin/sh", "-c", "grep CapBnd /proc/self/status").CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(output), "218/CAPABILITIES") || strings.Contains(string(output), "CapabilityBoundingSet") {
+			t.Skipf("宿主不允许 capability bounding set 限制: %s", strings.TrimSpace(string(output)))
+		}
+		t.Fatalf("运行 capability bounding set 探针: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	if mask := capabilityBoundingMask(t, output); mask != "400" {
+		t.Fatalf("transient service capability bounding set = %s，期望 CAP_NET_BIND_SERVICE (400)", mask)
+	}
+}
+
+func capabilityBoundingMask(t *testing.T, status []byte) string {
+	t.Helper()
+	match := regexp.MustCompile(`(?m)^CapBnd:\s+([[:xdigit:]]+)$`).FindSubmatch(status)
+	if match == nil {
+		t.Fatalf("进程状态缺少 CapBnd: %s", status)
+	}
+	mask := strings.TrimLeft(strings.ToLower(string(match[1])), "0")
+	if mask == "" {
+		return "0"
+	}
+	return mask
+}
+
 func TestGRPCTransportPrivateNetworkIsolation(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("PrivateNetwork 仅 Linux 支持")
