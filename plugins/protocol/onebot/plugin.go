@@ -33,6 +33,7 @@ type Plugin struct {
 	config    config.OneBotConfig
 	host      contract.Host
 	server    *http.Server
+	listener  net.Listener
 	started   bool
 	stopOnce  sync.Once
 	registrar contract.EndpointRegistrar
@@ -85,6 +86,7 @@ func (p *Plugin) Start(_ context.Context, host contract.Host) error {
 	p.mu.Lock()
 	p.host = host
 	p.server = server
+	p.listener = listener
 	p.registrar, _ = host.(contract.EndpointRegistrar)
 	p.started = true
 	p.mu.Unlock()
@@ -97,12 +99,22 @@ func (p *Plugin) Start(_ context.Context, host contract.Host) error {
 	return nil
 }
 
+func (p *Plugin) Addr() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.listener == nil {
+		return ""
+	}
+	return p.listener.Addr().String()
+}
+
 // Stop 关闭监听器与所有连接。
 func (p *Plugin) Stop(ctx context.Context) error {
 	var stopErr error
 	p.stopOnce.Do(func() {
 		p.mu.Lock()
 		server := p.server
+		p.listener = nil
 		p.server = nil
 		p.started = false
 		p.host = nil
