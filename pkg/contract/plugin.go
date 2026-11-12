@@ -85,6 +85,8 @@ type Limits struct {
 	PrivateNetwork          bool          `json:"private_network" yaml:"private_network"`
 	NoNewPrivileges         bool          `json:"no_new_privileges" yaml:"no_new_privileges"`
 	PrivateTmp              bool          `json:"private_tmp" yaml:"private_tmp"`
+	ProtectHome             bool          `json:"protect_home" yaml:"protect_home"`
+	ProtectSystem           bool          `json:"protect_system" yaml:"protect_system"`
 	RestrictSyscalls        bool          `json:"restrict_syscalls" yaml:"restrict_syscalls"`
 	RestrictAddressFamilies bool          `json:"restrict_address_families" yaml:"restrict_address_families"`
 	CapabilityBoundingSet   []string      `json:"capability_bounding_set,omitempty" yaml:"capability_bounding_set,omitempty"`

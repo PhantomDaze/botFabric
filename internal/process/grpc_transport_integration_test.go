@@ -18,12 +18,28 @@ import (
 	"testing"
 	"time"
 
+	botfabricv1 "github.com/PhantomDaze/botfabric/gen/botfabric/v1"
 	"github.com/PhantomDaze/botfabric/internal/eventbus"
 	"github.com/PhantomDaze/botfabric/internal/gateway"
 	"github.com/PhantomDaze/botfabric/internal/registry"
 	runtimepkg "github.com/PhantomDaze/botfabric/internal/runtime"
 	"github.com/PhantomDaze/botfabric/pkg/contract"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
+
+// helperPluginEnv 收集当前测试进程中的 helper 专用变量，显式传给外部插件。
+// 生产实现只继承最小环境白名单，测试辅助变量必须通过 ExtraEnv 显式声明。
+func helperPluginEnv() []string {
+	var env []string
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(name, "BOTFABRIC_HELPER_") {
+			env = append(env, entry)
+		}
+	}
+	return env
+}
 
 type integrationAllowPolicy struct{}
 
@@ -93,6 +109,7 @@ func TestGRPCTransportRestrictAddressFamiliesIsolation(t *testing.T) {
 	t.Setenv("BOTFABRIC_HELPER_PROBE_ADDRESS_FAMILY", "1")
 	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
 	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	transport.config.ExtraEnv = helperPluginEnv()
 	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
 		t.Skipf("RestrictAddressFamilies transient service 不可用: %v", err)
 	}
@@ -157,6 +174,7 @@ func TestGRPCTransportPrivateNetworkIsolation(t *testing.T) {
 	t.Setenv("BOTFABRIC_HELPER_PROBE_TCP", probeListener.Addr().String())
 	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
 	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	transport.config.ExtraEnv = helperPluginEnv()
 	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
 		t.Skipf("PrivateNetwork transient service 不可用: %v", err)
 	}
@@ -225,6 +243,7 @@ func TestGRPCTransportRestrictSyscallsEnablesSeccomp(t *testing.T) {
 	manifest.Limits.RestrictSyscalls = true
 	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
 	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	transport.config.ExtraEnv = helperPluginEnv()
 	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
 		t.Skipf("syscall filter transient service 不可用: %v", err)
 	}
@@ -335,6 +354,7 @@ func TestGRPCTransportPrivateTmpIsolation(t *testing.T) {
 	}
 	defer os.RemoveAll(socketDirectory)
 	socketPath := filepath.Join(socketDirectory, fmt.Sprintf("plugin-%d.sock", os.Getpid()))
+	transport.config.ExtraEnv = helperPluginEnv()
 	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
 		t.Skipf("PrivateTmp transient service 不可用: %v", err)
 	}
@@ -410,7 +430,7 @@ func TestGRPCTransportProcessSession(t *testing.T) {
 	var transport *GRPCTransport
 	loader, err := NewLoaderWithFactory(logger, t.TempDir(), NewSessionIssuer(), func(manifest contract.Manifest) (Transport, error) {
 		var err error
-		transport, err = NewGRPCTransport(GRPCTransportConfig{Logger: logger, MaxMessageSize: 1 << 20, MaxInFlight: 8})
+		transport, err = NewGRPCTransport(GRPCTransportConfig{Logger: logger, MaxMessageSize: 1 << 20, MaxInFlight: 8, ExtraEnv: helperPluginEnv()})
 		return transport, err
 	})
 	if err != nil {
@@ -563,6 +583,7 @@ func TestGRPCTransportRejectsInvalidSession(t *testing.T) {
 	t.Setenv("BOTFABRIC_HELPER_BAD_TOKEN", "1")
 	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
 	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	transport.config.ExtraEnv = helperPluginEnv()
 	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
 		t.Fatal(err)
 	}
@@ -605,6 +626,101 @@ func buildProcessHelperInDir(t *testing.T, directory string) string {
 	return output
 }
 
+func TestGRPCTransportFilesystemIsolation(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("文件系统隔离仅 Linux 支持")
+	}
+	if _, err := exec.LookPath("systemd-run"); err != nil {
+		t.Skipf("systemd-run 不可用: %v", err)
+	}
+	entries, err := os.ReadDir("/home")
+	if err != nil || len(entries) == 0 {
+		t.Skip("宿主 /home 不可读或为空，无法验证 ProtectHome")
+	}
+	if mountReadOnly(t, "/usr") {
+		t.Skip("宿主 /usr 已为只读挂载，无法验证 ProtectSystem")
+	}
+
+	logFile, err := os.CreateTemp(t.TempDir(), "filesystem-isolation-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	logger := slog.New(slog.NewTextHandler(logFile, nil))
+	helper := buildProcessHelper(t)
+	transport, err := NewGRPCTransport(GRPCTransportConfig{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	manifest.Entry = helper
+	manifest.Limits.ProtectHome = true
+	manifest.Limits.ProtectSystem = true
+	t.Setenv("BOTFABRIC_HELPER_PROBE_FILESYSTEM", "1")
+	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
+	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	transport.config.ExtraEnv = helperPluginEnv()
+	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
+		t.Skipf("文件系统隔离 transient service 不可用: %v", err)
+	}
+	defer transport.Kill()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// 文件系统隔离不能破坏插件的基本通信：Unix Socket Session 必须仍能建立。
+	if err := transport.Connect(ctx, socketPath); err != nil {
+		content, _ := os.ReadFile(logFile.Name())
+		t.Fatalf("文件系统隔离后插件仍应连接 Unix Socket Session: %v; plugin logs: %s", err, content)
+	}
+	if err := transport.HandshakeWithCallbacks(ctx, manifest, session, SessionCallbacks{}); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := logFile.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		content, err := os.ReadFile(logFile.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(content)
+		if strings.Contains(text, "protect home probe: exposed") {
+			t.Fatalf("ProtectHome 未生效: %s", text)
+		}
+		if strings.Contains(text, "protect system probe: writable") {
+			t.Fatalf("ProtectSystem 未生效: %s", text)
+		}
+		homeIsolated := strings.Contains(text, "protect home probe: hidden") || strings.Contains(text, "protect home probe: empty")
+		if homeIsolated && strings.Contains(text, "protect system probe: read-only") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	content, _ := os.ReadFile(logFile.Name())
+	t.Fatalf("未观察到文件系统隔离探测结果: %s", content)
+}
+
+func mountReadOnly(t *testing.T, mountPoint string) bool {
+	t.Helper()
+	content, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(content), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 5 && fields[4] == mountPoint {
+			for _, option := range strings.Split(fields[5], ",") {
+				if option == "ro" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func TestGRPCTransportKillsBlockedProcess(t *testing.T) {
 	helper := buildProcessHelper(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -617,6 +733,7 @@ func TestGRPCTransportKillsBlockedProcess(t *testing.T) {
 	t.Setenv("BOTFABRIC_HELPER_BLOCK_INVOKE", "1")
 	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
 	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	transport.config.ExtraEnv = helperPluginEnv()
 	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
 		t.Fatal(err)
 	}
@@ -660,6 +777,7 @@ func TestGRPCTransportEnforcesMemoryLimit(t *testing.T) {
 
 	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
 	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	transport.config.ExtraEnv = helperPluginEnv()
 	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
 		t.Fatal(err)
 	}
@@ -684,6 +802,7 @@ func TestGRPCTransportEnforcesMemoryLimit(t *testing.T) {
 	os.Unsetenv("BOTFABRIC_HELPER_ALLOC_PROBE")
 	os.Unsetenv("BOTFABRIC_HELPER_ALLOC_BYTES")
 	socketPath2 := filepath.Join(t.TempDir(), "plugin.sock")
+	transport2.config.ExtraEnv = helperPluginEnv()
 	if err := transport2.StartWithSession(context.Background(), manifest, socketPath2, session); err != nil {
 		t.Fatal(err)
 	}
@@ -724,6 +843,7 @@ func TestGRPCTransportCgroupCoversDescendants(t *testing.T) {
 
 	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
 	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	transport.config.ExtraEnv = helperPluginEnv()
 	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
 		t.Fatal(err)
 	}
@@ -823,6 +943,7 @@ func TestGRPCTransportKillsProcessGroup(t *testing.T) {
 	t.Setenv("BOTFABRIC_HELPER_FORK_CHILD", "1")
 	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
 	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	transport.config.ExtraEnv = helperPluginEnv()
 	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
 		t.Fatal(err)
 	}
@@ -896,4 +1017,241 @@ func TestGRPCTransportKillsProcessGroup(t *testing.T) {
 	if _, err := os.Stat(socketPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Kill 后 Unix Socket 仍存在: %v", err)
 	}
+}
+
+// TestGRPCTransportRequestSessionSurvivesExpiry 验证运行期请求不再按墙钟校验会话过期：
+// 握手完成后即使会话 TTL 已过，Deliver 与 Health 仍应成功（回归：插件上线 5 分钟后全部失效）。
+func TestGRPCTransportRequestSessionSurvivesExpiry(t *testing.T) {
+	helper := buildProcessHelper(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	transport, err := NewGRPCTransport(GRPCTransportConfig{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	manifest.Entry = helper
+	manifest.Provides.Subscriptions = []string{"process.input"}
+	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
+	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	transport.config.ExtraEnv = helperPluginEnv()
+	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Kill()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := transport.Connect(ctx, socketPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := transport.HandshakeWithCallbacks(ctx, manifest, session, SessionCallbacks{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟会话自然过期：握手后把期望会话与请求会话都设为已过期。
+	expired := session
+	expired.ExpiresAt = time.Now().Add(-time.Minute)
+	transport.mu.Lock()
+	transport.expected = expired
+	transport.mu.Unlock()
+	if err := transport.Deliver(ctx, expired, contract.Event{ID: "evt-expired", Topic: "process.input", Payload: []byte("x")}); err != nil {
+		t.Fatalf("会话过期后 Deliver 应成功: %v", err)
+	}
+	if _, err := transport.Health(ctx, expired); err != nil {
+		t.Fatalf("会话过期后 Health 应成功: %v", err)
+	}
+}
+
+// TestMinimalPluginEnvironmentExcludesHostSecrets 验证外部插件环境只取白名单，
+// 宿主秘密不会随 os.Environ 泄露。
+func TestMinimalPluginEnvironmentExcludesHostSecrets(t *testing.T) {
+	t.Setenv("BOTFABRIC_CLASSIFIER_REAL_LLM_API_KEY", "host-secret")
+	t.Setenv("BOTFABRIC_SESSION_TOKEN", "host-token")
+	env := minimalPluginEnvironment([]string{"PLUGIN_EXTRA=1"})
+	joined := strings.Join(env, "\n")
+	for _, forbidden := range []string{"BOTFABRIC_CLASSIFIER_REAL_LLM_API_KEY", "BOTFABRIC_SESSION_TOKEN"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("插件环境不应包含宿主秘密 %s: %s", forbidden, joined)
+		}
+	}
+	if !strings.Contains(joined, "PLUGIN_EXTRA=1") {
+		t.Fatalf("显式声明的额外变量应被保留: %s", joined)
+	}
+	if value, ok := os.LookupEnv("PATH"); ok && !strings.Contains(joined, "PATH="+value) {
+		t.Fatalf("白名单变量 PATH 应被保留: %s", joined)
+	}
+}
+
+// TestGRPCTransportRejectsUnexpectedPeerPID 验证同 UID 但非插件进程的连接
+// 会被 SO_PEERCRED 校验拒绝，无法抢占插件会话。
+func TestGRPCTransportRejectsUnexpectedPeerPID(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("SO_PEERCRED 仅 Linux 支持")
+	}
+	helper := buildProcessHelper(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	transport, err := NewGRPCTransport(GRPCTransportConfig{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	manifest.Entry = helper
+	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
+	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	transport.config.ExtraEnv = helperPluginEnv()
+	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Kill()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := transport.Connect(ctx, socketPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := transport.HandshakeWithCallbacks(ctx, manifest, session, SessionCallbacks{}); err != nil {
+		t.Fatal(err)
+	}
+
+	transport.mu.RLock()
+	listener := transport.peerListener
+	transport.mu.RUnlock()
+	if listener == nil || listener.expectedPID <= 0 {
+		t.Fatalf("peer 凭据监听器未初始化: %#v", listener)
+	}
+
+	// 测试进程与插件同 UID 但 PID 不同，模拟被攻破的兄弟插件。
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), time.Second)
+	defer dialCancel()
+	connection, err := grpc.DialContext(dialCtx, "passthrough:///botfabric",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	streamCtx, streamCancel := context.WithTimeout(context.Background(), time.Second)
+	defer streamCancel()
+	if stream, sessionErr := botfabricv1.NewProcessPluginClient(connection).Session(streamCtx); sessionErr == nil {
+		if _, recvErr := stream.Recv(); recvErr == nil {
+			t.Fatal("非插件进程不应建立有效 Session")
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if listener.rejected.Load() > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("对端 PID 不匹配的连接未被拒绝")
+}
+
+// TestGRPCTransportNotifiesUnexpectedExit 验证插件进程崩溃后 transport 关闭
+// Done 通道并携带退出错误，供 managedPlugin 回传 Runtime。
+func TestGRPCTransportNotifiesUnexpectedExit(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("依赖 Linux 信号与 /proc")
+	}
+	helper := buildProcessHelper(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	transport, err := NewGRPCTransport(GRPCTransportConfig{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	manifest.Entry = helper
+	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
+	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	transport.config.ExtraEnv = helperPluginEnv()
+	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Kill()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := transport.Connect(ctx, socketPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := transport.HandshakeWithCallbacks(ctx, manifest, session, SessionCallbacks{}); err != nil {
+		t.Fatal(err)
+	}
+	transport.mu.RLock()
+	pid := transport.peerPID
+	transport.mu.RUnlock()
+	if pid <= 0 {
+		t.Fatalf("插件 PID 无效: %d", pid)
+	}
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-transport.Done():
+		if transport.ExitError() == nil {
+			t.Fatal("异常退出应记录退出错误")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("插件进程退出后未触发 Done")
+	}
+}
+
+// TestGRPCTransportEnvAllowlistIsolation 验证外部插件进程收不到宿主秘密，
+// 同时仍能获得运行所需的 BOTFABRIC_* 会话变量。
+func TestGRPCTransportEnvAllowlistIsolation(t *testing.T) {
+	logFile, err := os.CreateTemp(t.TempDir(), "env-allowlist-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	logger := slog.New(slog.NewTextHandler(logFile, nil))
+	t.Setenv("BOTFABRIC_CLASSIFIER_REAL_LLM_API_KEY", "host-secret-value")
+	helper := buildProcessHelper(t)
+	transport, err := NewGRPCTransport(GRPCTransportConfig{Logger: logger, ExtraEnv: []string{"BOTFABRIC_HELPER_PROBE_ENV=1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	manifest.Entry = helper
+	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(time.Minute)}
+	socketPath := filepath.Join(t.TempDir(), "plugin.sock")
+	transport.config.ExtraEnv = append(transport.config.ExtraEnv, helperPluginEnv()...)
+	if err := transport.StartWithSession(context.Background(), manifest, socketPath, session); err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Kill()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := transport.Connect(ctx, socketPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := transport.HandshakeWithCallbacks(ctx, manifest, session, SessionCallbacks{}); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := logFile.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		content, err := os.ReadFile(logFile.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(content)
+		if strings.Contains(text, "env probe: secret-leaked") {
+			t.Fatalf("宿主秘密泄露到外部插件: %s", text)
+		}
+		if strings.Contains(text, "env probe: isolated") {
+			if strings.Contains(text, "host-secret-value") {
+				t.Fatalf("插件环境泄露宿主秘密值: %s", text)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	content, _ := os.ReadFile(logFile.Name())
+	t.Fatalf("未观察到环境隔离探测结果: %s", content)
 }

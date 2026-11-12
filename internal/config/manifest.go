@@ -28,6 +28,8 @@ type manifestLimits struct {
 	PrivateNetwork          bool     `yaml:"private_network"`
 	NoNewPrivileges         bool     `yaml:"no_new_privileges"`
 	PrivateTmp              bool     `yaml:"private_tmp"`
+	ProtectHome             bool     `yaml:"protect_home"`
+	ProtectSystem           bool     `yaml:"protect_system"`
 	RestrictSyscalls        bool     `yaml:"restrict_syscalls"`
 	RestrictAddressFamilies bool     `yaml:"restrict_address_families"`
 	CapabilityBoundingSet   []string `yaml:"capability_bounding_set"`
@@ -173,6 +175,8 @@ func LoadManifest(path string) (contract.Manifest, error) {
 			PrivateNetwork:          raw.Limits.PrivateNetwork,
 			NoNewPrivileges:         raw.Limits.NoNewPrivileges,
 			PrivateTmp:              raw.Limits.PrivateTmp,
+			ProtectHome:             raw.Limits.ProtectHome,
+			ProtectSystem:           raw.Limits.ProtectSystem,
 			RestrictSyscalls:        raw.Limits.RestrictSyscalls,
 			RestrictAddressFamilies: raw.Limits.RestrictAddressFamilies,
 			CapabilityBoundingSet:   raw.Limits.CapabilityBoundingSet,
@@ -236,6 +240,7 @@ func ValidateManifest(manifest contract.Manifest) error {
 
 func requestsProcessIsolation(limits contract.Limits) bool {
 	return limits.PrivateNetwork || limits.NoNewPrivileges || limits.PrivateTmp ||
+		limits.ProtectHome || limits.ProtectSystem ||
 		limits.RestrictSyscalls || limits.RestrictAddressFamilies || limits.CapabilityBoundingSet != nil
 }
 

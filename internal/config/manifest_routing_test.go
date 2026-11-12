@@ -150,6 +150,8 @@ limits:
   private_network: true
   no_new_privileges: true
   private_tmp: true
+  protect_home: true
+  protect_system: true
   restrict_syscalls: true
   restrict_address_families: true
 `
@@ -160,7 +162,7 @@ limits:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !manifest.Limits.PrivateNetwork || !manifest.Limits.NoNewPrivileges || !manifest.Limits.PrivateTmp || !manifest.Limits.RestrictSyscalls || !manifest.Limits.RestrictAddressFamilies {
+	if !manifest.Limits.PrivateNetwork || !manifest.Limits.NoNewPrivileges || !manifest.Limits.PrivateTmp || !manifest.Limits.ProtectHome || !manifest.Limits.ProtectSystem || !manifest.Limits.RestrictSyscalls || !manifest.Limits.RestrictAddressFamilies {
 		t.Fatalf("隔离限制未解析: %#v", manifest.Limits)
 	}
 }
@@ -201,6 +203,8 @@ func TestValidateManifestRejectsIsolationOnUnsupportedPlatform(t *testing.T) {
 		{Timeout: 1, Memory: "64MiB", PrivateNetwork: true},
 		{Timeout: 1, Memory: "64MiB", NoNewPrivileges: true},
 		{Timeout: 1, Memory: "64MiB", PrivateTmp: true},
+		{Timeout: 1, Memory: "64MiB", ProtectHome: true},
+		{Timeout: 1, Memory: "64MiB", ProtectSystem: true},
 		{Timeout: 1, Memory: "64MiB", RestrictSyscalls: true},
 		{Timeout: 1, Memory: "64MiB", RestrictAddressFamilies: true},
 		{Timeout: 1, Memory: "64MiB", CapabilityBoundingSet: []string{}},
@@ -215,6 +219,25 @@ func TestValidateManifestRejectsIsolationOnUnsupportedPlatform(t *testing.T) {
 		}
 		if err := ValidateManifest(manifest); err == nil {
 			t.Fatalf("非 Linux 平台不应接受隔离配置: %#v", limits)
+		}
+	}
+}
+
+func TestValidateManifestRejectsFilesystemIsolationForInProcess(t *testing.T) {
+	for _, limits := range []contract.Limits{
+		{Timeout: 1, ProtectHome: true},
+		{Timeout: 1, ProtectSystem: true},
+	} {
+		manifest := contract.Manifest{
+			ID:      "inprocess.filesystem",
+			Name:    "In-process Filesystem",
+			Version: "0.1.0",
+			Runtime: contract.RuntimeInProcess,
+			Entry:   "builtin.example",
+			Limits:  limits,
+		}
+		if err := ValidateManifest(manifest); err == nil {
+			t.Fatalf("in_process 插件不应声明文件系统隔离: %#v", limits)
 		}
 	}
 }

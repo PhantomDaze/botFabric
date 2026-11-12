@@ -39,7 +39,18 @@ type GRPCTransportConfig struct {
 	Logger         *slog.Logger
 	MaxMessageSize int64
 	MaxInFlight    int
-} // GRPCTransport 是 Runtime-owned Unix Socket 上的双向 gRPC transport。
+	// ExtraEnv 是运维显式声明需要传给该插件的额外环境变量（name=value）。
+	// 宿主环境默认不继承，避免 LLM API key 等秘密泄露给外部插件。
+	ExtraEnv []string
+} // peerCredListener 在 Accept 后校验对端进程凭据，并统计被拒绝的连接。
+// 具体校验逻辑由 peercred_linux.go / peercred_other.go 提供。
+type peerCredListener struct {
+	net.Listener
+	expectedPID int
+	rejected    atomic.Int64
+}
+
+// GRPCTransport 是 Runtime-owned Unix Socket 上的双向 gRPC transport。
 // 每个实例只托管一个外部插件进程和一条 Session，避免不同插件共享状态。
 type GRPCTransport struct {
 	botfabricv1.UnimplementedProcessPluginServer
@@ -66,6 +77,11 @@ type GRPCTransport struct {
 	disconnectOnce    sync.Once
 	stream            *grpcSessionStream
 	sessionClaimed    bool
+	peerPID           int
+	peerListener      *peerCredListener
+	exitDone          chan struct{}
+	exitOnce          sync.Once
+	exitErr           error
 	callbacks         SessionCallbacks
 	callbacksBound    bool
 	sessionCancel     context.CancelFunc
@@ -101,7 +117,44 @@ func NewGRPCTransport(config GRPCTransportConfig) (*GRPCTransport, error) {
 	if config.MaxInFlight <= 0 {
 		config.MaxInFlight = defaultProcessInFlight
 	}
-	return &GRPCTransport{config: config}, nil
+	return &GRPCTransport{config: config, exitDone: make(chan struct{})}, nil
+}
+
+// Done 返回 transport 终止信号；插件进程或 gRPC 服务退出后关闭。
+// managedPlugin 通过它感知外部进程异常退出并回传 Runtime。
+func (t *GRPCTransport) Done() <-chan struct{} {
+	return t.exitSignal()
+}
+
+// ExitError 返回导致 transport 终止的错误；正常停止时返回 nil。
+func (t *GRPCTransport) ExitError() error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.exitErr
+}
+
+// exitSignal 返回（必要时惰性创建）退出信号通道，兼容直接构造的结构体。
+func (t *GRPCTransport) exitSignal() chan struct{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.exitDone == nil {
+		t.exitDone = make(chan struct{})
+	}
+	return t.exitDone
+}
+
+// notifyExit 只触发一次退出通知；shutdown 为正常的主动停止。
+func (t *GRPCTransport) notifyExit(err error) {
+	t.exitOnce.Do(func() {
+		t.mu.Lock()
+		if t.exitDone == nil {
+			t.exitDone = make(chan struct{})
+		}
+		done := t.exitDone
+		t.exitErr = err
+		t.mu.Unlock()
+		close(done)
+	})
 }
 
 // Start 为旧 Transport 接口保留入口；完整 transport 应使用 StartWithSession。
@@ -123,6 +176,8 @@ type processIsolation struct {
 	privateNetwork          bool
 	noNewPrivileges         bool
 	privateTmp              bool
+	protectHome             bool
+	protectSystem           bool
 	restrictSyscalls        bool
 	restrictAddressFamilies bool
 	capabilityBoundingSet   []string
@@ -134,6 +189,8 @@ func isolationFromManifest(manifest contract.Manifest) processIsolation {
 		privateNetwork:          manifest.Limits.PrivateNetwork,
 		noNewPrivileges:         manifest.Limits.NoNewPrivileges,
 		privateTmp:              manifest.Limits.PrivateTmp,
+		protectHome:             manifest.Limits.ProtectHome,
+		protectSystem:           manifest.Limits.ProtectSystem,
 		restrictSyscalls:        manifest.Limits.RestrictSyscalls,
 		restrictAddressFamilies: manifest.Limits.RestrictAddressFamilies,
 		capabilityBoundingSet:   manifest.Limits.CapabilityBoundingSet,
@@ -143,6 +200,7 @@ func isolationFromManifest(manifest contract.Manifest) processIsolation {
 // requested 报告是否请求了任何隔离属性；请求时启动必须走 systemd 且失败不降级。
 func (o processIsolation) requested() bool {
 	return o.privateNetwork || o.noNewPrivileges || o.privateTmp ||
+		o.protectHome || o.protectSystem ||
 		o.restrictSyscalls || o.restrictAddressFamilies || o.capabilityBoundingSet != nil
 }
 
@@ -170,6 +228,11 @@ func (t *GRPCTransport) start(ctx context.Context, manifest contract.Manifest, s
 	if manifest.Limits.PrivateTmp {
 		if err := validatePrivateTmpSocketPath(socketPath); err != nil {
 			return fmt.Errorf("启动需要 PrivateTmp 的外部插件失败: %w", err)
+		}
+	}
+	if manifest.Limits.ProtectHome {
+		if err := validateProtectHomeSocketPath(socketPath); err != nil {
+			return fmt.Errorf("启动需要 ProtectHome 的外部插件失败: %w", err)
 		}
 	}
 	if err := prepareSocketPath(socketPath); err != nil {
@@ -221,7 +284,8 @@ func (t *GRPCTransport) start(ctx context.Context, manifest contract.Manifest, s
 
 	command := exec.Command(manifest.Entry)
 	prepareProcessGroup(command)
-	command.Env = append(os.Environ(),
+	command.Env = minimalPluginEnvironment(t.config.ExtraEnv)
+	command.Env = append(command.Env,
 		"BOTFABRIC_SOCKET="+socketPath,
 		"BOTFABRIC_PLUGIN_ID="+manifest.ID,
 		"BOTFABRIC_PLUGIN_VERSION="+manifest.Version,
@@ -259,22 +323,32 @@ func (t *GRPCTransport) start(ctx context.Context, manifest contract.Manifest, s
 			})}
 		}
 	}
+	peerPID := 0
+	if command.Process != nil {
+		peerPID = command.Process.Pid
+	}
+	// 只接受由本 transport 启动的插件进程连接，阻止同 UID 的其他进程抢占会话。
+	peerListener := &peerCredListener{Listener: listener, expectedPID: peerPID}
 	t.mu.Lock()
 	t.process = command
 	t.processGroupID = processGroupID(command.Process)
 	t.memoryEnforcer = enforcer
+	t.peerPID = peerPID
+	t.peerListener = peerListener
 	t.mu.Unlock()
 	go t.waitProcess(command)
 	go func() {
-		if err := server.Serve(listener); err != nil {
+		if err := server.Serve(peerListener); err != nil {
 			t.mu.RLock()
 			stopped := t.stopped
 			t.mu.RUnlock()
 			if !stopped {
 				t.config.Logger.Error("外部插件 gRPC 服务退出", "plugin_id", manifest.ID, "error", err)
-				t.markDisconnected(fmt.Errorf("gRPC 服务退出: %w", err))
+				err = fmt.Errorf("gRPC 服务退出: %w", err)
+				t.markDisconnected(err)
 				_ = t.killProcess()
 				_ = t.cleanup()
+				t.notifyExit(err)
 			}
 		}
 	}()
@@ -512,6 +586,12 @@ func (t *GRPCTransport) waitProcess(command *exec.Cmd) {
 	if err != nil && !shutdown {
 		t.config.Logger.Warn("外部插件进程退出", "plugin_id", t.manifest.ID, "error", err)
 	}
+	// 主动停机返回 nil；异常退出携带进程错误，供 Runtime 迁移插件状态。
+	if shutdown {
+		t.notifyExit(nil)
+	} else {
+		t.notifyExit(processExitError(err))
+	}
 }
 
 // waitPluginProcess 等待插件进程退出并返回其退出错误。
@@ -524,6 +604,25 @@ func waitPluginProcess(command *exec.Cmd, managed bool) error {
 		return waitManagedProcess(command)
 	}
 	return command.Wait()
+}
+
+// pluginEnvironmentAllowlist 是允许外部插件继承的宿主环境变量名。
+// 只保留运行所需的通用变量，LLM API key 等秘密绝不透传。
+var pluginEnvironmentAllowlist = []string{
+	"PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TZ", "SHELL",
+	"LANG", "LC_ALL", "LC_CTYPE", "TERM",
+}
+
+// minimalPluginEnvironment 构造外部插件的最小环境：显式白名单 + 运维声明的额外变量。
+// 后续由 start 追加 BOTFABRIC_* 会话变量。
+func minimalPluginEnvironment(extra []string) []string {
+	env := make([]string, 0, len(pluginEnvironmentAllowlist)+len(extra))
+	for _, name := range pluginEnvironmentAllowlist {
+		if value, ok := os.LookupEnv(name); ok {
+			env = append(env, name+"="+value)
+		}
+	}
+	return append(env, extra...)
 }
 
 func processExitError(err error) error {
@@ -572,7 +671,9 @@ func (t *GRPCTransport) validateExpectedSession(manifest contract.Manifest, sess
 }
 
 func (t *GRPCTransport) validateRequestSession(session Session) error {
-	if session.PluginID == "" || session.Token == "" || !session.ExpiresAt.After(time.Now()) {
+	// 会话过期只用于握手认证；请求期按墙钟校验会使长驻插件在 TTL 到期后永久失效，
+	// 因此这里只校验凭据与连接绑定关系。
+	if session.PluginID == "" || session.Token == "" {
 		return errors.New("外部插件会话无效")
 	}
 	t.mu.RLock()
@@ -1109,13 +1210,14 @@ func asServiceErrorValue(err error) *contract.ServiceError {
 	return &contract.ServiceError{Code: contract.ErrorInternal, Message: err.Error()}
 }
 
-func validatePrivateTmpSocketPath(socketPath string) error {
+// socketPathCandidates 返回 Unix Socket 目录的绝对路径，并解析已存在前缀的符号链接。
+func socketPathCandidates(socketPath string) (directory, resolved string, err error) {
 	absolute, err := filepath.Abs(filepath.Clean(socketPath))
 	if err != nil {
-		return fmt.Errorf("解析外部插件 Unix Socket 路径: %w", err)
+		return "", "", fmt.Errorf("解析外部插件 Unix Socket 路径: %w", err)
 	}
-
-	resolved := filepath.Dir(absolute)
+	directory = filepath.Dir(absolute)
+	resolved = directory
 	var suffix []string
 	for {
 		candidate := resolved
@@ -1124,36 +1226,63 @@ func validatePrivateTmpSocketPath(socketPath string) error {
 			for i := len(suffix) - 1; i >= 0; i-- {
 				resolved = filepath.Join(resolved, suffix[i])
 			}
-			break
+			return directory, resolved, nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("解析 Unix Socket 目录: %w", err)
+			return "", "", fmt.Errorf("解析 Unix Socket 目录: %w", err)
 		}
 		parent := filepath.Dir(candidate)
 		if parent == candidate {
-			return fmt.Errorf("无法解析 Unix Socket 目录: %s", filepath.Dir(absolute))
+			return "", "", fmt.Errorf("无法解析 Unix Socket 目录: %s", directory)
 		}
 		suffix = append(suffix, filepath.Base(candidate))
 		resolved = parent
 	}
+}
 
+func validatePrivateTmpSocketPath(socketPath string) error {
+	directory, resolved, err := socketPathCandidates(socketPath)
+	if err != nil {
+		return err
+	}
 	// 即使目录当前不存在也拒绝临时根下的路径；若父目录可解析，再检查符号链接目标。
-	directory := filepath.Dir(absolute)
 	for _, root := range []string{"/tmp", "/var/tmp"} {
-		blocked := root
-		if target, resolveErr := filepath.EvalSymlinks(root); resolveErr == nil {
-			blocked = target
-		}
-		for _, candidate := range []string{directory, resolved} {
-			for _, base := range []string{root, blocked} {
-				relative, relErr := filepath.Rel(base, candidate)
-				if relErr == nil && (relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))) {
-					return fmt.Errorf("PrivateTmp 插件的 Unix Socket 不能位于 %s 或其子目录", root)
-				}
-			}
+		if blockedSocketPath(root, directory, resolved) {
+			return fmt.Errorf("PrivateTmp 插件的 Unix Socket 不能位于 %s 或其子目录", root)
 		}
 	}
 	return nil
+}
+
+// validateProtectHomeSocketPath 拒绝会被 ProtectHome=yes 隐藏的 Socket 路径。
+func validateProtectHomeSocketPath(socketPath string) error {
+	directory, resolved, err := socketPathCandidates(socketPath)
+	if err != nil {
+		return err
+	}
+	for _, root := range []string{"/home", "/root", "/run/user"} {
+		if blockedSocketPath(root, directory, resolved) {
+			return fmt.Errorf("ProtectHome 插件的 Unix Socket 不能位于 %s 或其子目录", root)
+		}
+	}
+	return nil
+}
+
+// blockedSocketPath 报告 Socket 目录（含符号链接解析结果）是否位于受限根目录下。
+func blockedSocketPath(root, directory, resolved string) bool {
+	blocked := root
+	if target, err := filepath.EvalSymlinks(root); err == nil {
+		blocked = target
+	}
+	for _, candidate := range []string{directory, resolved} {
+		for _, base := range []string{root, blocked} {
+			relative, err := filepath.Rel(base, candidate)
+			if err == nil && (relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func prepareSocketPath(path string) error {

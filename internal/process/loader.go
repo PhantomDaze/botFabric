@@ -83,6 +83,7 @@ type Loader struct {
 	transport        Transport
 	transportFactory TransportFactory
 	sessionTTL       time.Duration
+	failureHandler   func(pluginID string, err error)
 }
 
 // NewLoader 创建使用固定 transport 的外部进程加载器。
@@ -114,6 +115,24 @@ func NewLoaderWithFactory(logger *slog.Logger, socketDirectory string, issuer Se
 	}
 	loader.transportFactory = factory
 	return loader, nil
+}
+
+// SetSessionTTL 设置外部插件会话有效期。
+// 会话有效期只用于启动握手认证；运行期投递/服务调用不按墙钟过期。
+func (l *Loader) SetSessionTTL(ttl time.Duration) error {
+	if ttl <= 0 {
+		return errors.New("会话有效期必须大于零")
+	}
+	l.sessionTTL = ttl
+	return nil
+}
+
+// SetFailureHandler 注册外部插件异常退出回调，通常指向 Runtime 的状态迁移逻辑。
+// 应在加载插件前调用。
+func (l *Loader) SetFailureHandler(handler func(pluginID string, err error)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.failureHandler = handler
 }
 
 // Kind 返回加载器处理的执行模型。
@@ -148,14 +167,15 @@ func (l *Loader) Load(manifest contract.Manifest, host contract.Host) (contract.
 		return nil, fmt.Errorf("生成插件 %s 的 Unix Socket 路径: %w", manifest.ID, err)
 	}
 	return &managedPlugin{
-		manifest:   manifest,
-		host:       host,
-		logger:     l.logger.With("plugin_id", manifest.ID),
-		socketPath: socketPath,
-		issuer:     l.issuer,
-		transport:  transport,
-		sessionTTL: l.sessionTTL,
-		state:      HandshakeCreated,
+		manifest:       manifest,
+		host:           host,
+		logger:         l.logger.With("plugin_id", manifest.ID),
+		socketPath:     socketPath,
+		issuer:         l.issuer,
+		transport:      transport,
+		sessionTTL:     l.sessionTTL,
+		state:          HandshakeCreated,
+		failureHandler: l.failureHandler,
 	}, nil
 }
 

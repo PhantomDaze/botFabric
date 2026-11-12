@@ -184,3 +184,131 @@ func processManifest() contract.Manifest {
 		},
 	}
 }
+
+// TestValidateRequestSessionIgnoresWallClockExpiry 验证会话过期只影响握手认证，
+// 请求期不再按墙钟拒绝：运行超过会话 TTL 的长驻插件仍能接收投递与健康检查。
+func TestValidateRequestSessionIgnoresWallClockExpiry(t *testing.T) {
+	transport, err := NewGRPCTransport(GRPCTransportConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := processManifest()
+	session := Session{PluginID: manifest.ID, Token: "runtime-token", ExpiresAt: time.Now().Add(-time.Hour)}
+	transport.mu.Lock()
+	transport.manifest = manifest
+	transport.expected = session
+	transport.started = true
+	transport.ready = true
+	transport.disconnected = make(chan struct{})
+	transport.mu.Unlock()
+	if err := transport.validateRequestSession(session); err != nil {
+		t.Fatalf("过期会话在请求期仍应可用: %v", err)
+	}
+	// 凭据不匹配仍必须拒绝。
+	forged := session
+	forged.Token = "forged-token"
+	if err := transport.validateRequestSession(forged); err == nil {
+		t.Fatal("凭据不匹配的会话应被拒绝")
+	}
+}
+
+// TestLoaderSessionTTLConfigurable 验证会话有效期可配置并传递到插件实例。
+func TestLoaderSessionTTLConfigurable(t *testing.T) {
+	loader, err := NewLoader(nil, t.TempDir(), fakeIssuer{session: Session{PluginID: "process.example", Token: "token", ExpiresAt: time.Now().Add(time.Minute)}}, &fakeTransport{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := loader.SetSessionTTL(0); err == nil {
+		t.Fatal("非正会话有效期应被拒绝")
+	}
+	const ttl = 100 * time.Millisecond
+	if err := loader.SetSessionTTL(ttl); err != nil {
+		t.Fatal(err)
+	}
+	plugin, err := loader.Load(processManifest(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := plugin.(*managedPlugin).sessionTTL; got != ttl {
+		t.Fatalf("插件会话有效期 = %v，期望 %v", got, ttl)
+	}
+}
+
+// exitTransport 在前端 transport 基础上暴露退出通知，用于验证异常退出回调。
+type exitTransport struct {
+	*fakeTransport
+	done    chan struct{}
+	exitErr error
+}
+
+func (t *exitTransport) Done() <-chan struct{} { return t.done }
+func (t *exitTransport) ExitError() error      { return t.exitErr }
+
+// TestManagedPluginReportsAbnormalExit 验证 transport 退出后 managedPlugin
+// 迁移为 failed 并调用注入的失败回调，供 Runtime 回滚资源。
+func TestManagedPluginReportsAbnormalExit(t *testing.T) {
+	transport := &exitTransport{fakeTransport: &fakeTransport{}, done: make(chan struct{})}
+	failures := make(chan error, 1)
+	plugin := &managedPlugin{
+		manifest:   processManifest(),
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		socketPath: filepath.Join(t.TempDir(), "plugin.sock"),
+		issuer:     fakeIssuer{session: Session{PluginID: "process.example", Token: "token", ExpiresAt: time.Now().Add(time.Minute)}},
+		transport:  transport,
+		sessionTTL: time.Minute,
+		state:      HandshakeCreated,
+		failureHandler: func(pluginID string, err error) {
+			failures <- errors.New(pluginID + ": " + err.Error())
+		},
+	}
+	if err := plugin.Start(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	transport.exitErr = errors.New("进程崩溃")
+	close(transport.done)
+	select {
+	case err := <-failures:
+		if !strings.Contains(err.Error(), "进程崩溃") {
+			t.Fatalf("失败回调错误 = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("异常退出未触发失败回调")
+	}
+	plugin.mu.RLock()
+	state := plugin.state
+	plugin.mu.RUnlock()
+	if state != HandshakeFailed {
+		t.Fatalf("握手状态 = %s，期望 failed", state)
+	}
+}
+
+// TestManagedPluginIgnoresExpectedExit 验证主动停止后 transport 退出不触发失败回调。
+func TestManagedPluginIgnoresExpectedExit(t *testing.T) {
+	transport := &exitTransport{fakeTransport: &fakeTransport{}, done: make(chan struct{})}
+	failures := make(chan error, 1)
+	plugin := &managedPlugin{
+		manifest:   processManifest(),
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		socketPath: filepath.Join(t.TempDir(), "plugin.sock"),
+		issuer:     fakeIssuer{session: Session{PluginID: "process.example", Token: "token", ExpiresAt: time.Now().Add(time.Minute)}},
+		transport:  transport,
+		sessionTTL: time.Minute,
+		state:      HandshakeCreated,
+		failureHandler: func(_ string, err error) {
+			failures <- err
+		},
+	}
+	if err := plugin.Start(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := plugin.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	transport.exitErr = errors.New("正常关闭")
+	close(transport.done)
+	select {
+	case err := <-failures:
+		t.Fatalf("主动停止不应触发失败回调: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+}

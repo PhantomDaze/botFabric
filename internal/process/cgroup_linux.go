@@ -64,7 +64,7 @@ func startCgroupMemoryLimit(command *exec.Cmd, bytes int64, isolation processIso
 		_ = os.RemoveAll(logDir)
 	})
 
-	logger.Info("外部插件已启动 systemd 托管", "plugin_id", pluginID, "memory_max_bytes", bytes, "private_network", isolation.privateNetwork, "no_new_privileges", isolation.noNewPrivileges, "private_tmp", isolation.privateTmp, "restrict_syscalls", isolation.restrictSyscalls, "restrict_address_families", isolation.restrictAddressFamilies, "capability_bounding_set", isolation.capabilityBoundingSet, "unit", unit)
+	logger.Info("外部插件已启动 systemd 托管", "plugin_id", pluginID, "memory_max_bytes", bytes, "private_network", isolation.privateNetwork, "no_new_privileges", isolation.noNewPrivileges, "private_tmp", isolation.privateTmp, "protect_home", isolation.protectHome, "protect_system", isolation.protectSystem, "restrict_syscalls", isolation.restrictSyscalls, "restrict_address_families", isolation.restrictAddressFamilies, "capability_bounding_set", isolation.capabilityBoundingSet, "unit", unit)
 	return &memoryEnforcer{
 		stop:    stopLogs,
 		managed: true,
@@ -112,6 +112,12 @@ func startTransientService(systemdRun string, command *exec.Cmd, memoryBytes int
 	}
 	if isolation.privateTmp {
 		args = append(args, "-p", "PrivateTmp=yes")
+	}
+	if isolation.protectHome {
+		args = append(args, "-p", "ProtectHome=yes")
+	}
+	if isolation.protectSystem {
+		args = append(args, "-p", "ProtectSystem=full")
 	}
 	if isolation.restrictAddressFamilies {
 		args = append(args, "-p", "RestrictAddressFamilies=AF_UNIX")

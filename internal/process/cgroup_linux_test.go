@@ -120,6 +120,41 @@ func TestStartTransientServicePrivateTmpWithoutOtherIsolation(t *testing.T) {
 	}
 }
 
+func TestStartTransientServiceProtectsFilesystem(t *testing.T) {
+	tmp := t.TempDir()
+	binDir := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argsPath := filepath.Join(tmp, "args")
+	systemdRun := filepath.Join(binDir, "systemd-run")
+	systemctl := filepath.Join(binDir, "systemctl")
+	writeExecutable(t, systemdRun, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BOTFABRIC_TEST_ARGS\"\n")
+	writeExecutable(t, systemctl, "#!/bin/sh\nprintf '1\\n'\n")
+	t.Setenv("PATH", binDir)
+	t.Setenv("BOTFABRIC_TEST_ARGS", argsPath)
+	t.Setenv("TMPDIR", tmp)
+
+	_, _, _, _, logDir, err := startTransientService(systemdRun, exec.Command("/bin/true"), 0, processIsolation{protectHome: true, protectSystem: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(logDir)
+	content, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimSpace(string(content)), "\n")
+	if !containsAdjacent(args, "-p", "ProtectHome=yes") || !containsAdjacent(args, "-p", "ProtectSystem=full") {
+		t.Fatalf("systemd-run 参数未启用文件系统隔离: %q", args)
+	}
+	for _, property := range []string{"PrivateNetwork=yes", "NoNewPrivileges=yes", "PrivateTmp=yes", "MemoryMax=0"} {
+		if containsAdjacent(args, "-p", property) {
+			t.Fatalf("文件系统隔离不应隐式启用 %s: %q", property, args)
+		}
+	}
+}
+
 func TestCreateTransientServiceLogDirWithPrivateTmpUsesPersistentDirectory(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -308,6 +343,41 @@ fi
 	}
 }
 
+func TestSystemdFilesystemProtectionProbe(t *testing.T) {
+	systemdRun, err := exec.LookPath("systemd-run")
+	if err != nil {
+		t.Skipf("systemd-run 不可用: %v", err)
+	}
+	t.Run("protect-home", func(t *testing.T) {
+		entries, err := os.ReadDir("/home")
+		if err != nil || len(entries) == 0 {
+			t.Skip("宿主 /home 不可读或为空，无法验证 ProtectHome")
+		}
+		out, err := exec.Command(systemdRun, "--user", "--wait", "--pipe", "--collect",
+			"-p", "ProtectHome=yes", "/bin/sh", "-c",
+			"if ls -A /home >/dev/null 2>&1; then echo exposed; else echo hidden; fi").CombinedOutput()
+		if err != nil {
+			t.Skipf("宿主无法运行 ProtectHome 探针: %v (%s)", err, strings.TrimSpace(string(out)))
+		}
+		if !strings.Contains(string(out), "hidden") {
+			t.Fatalf("ProtectHome 未隔离 /home: %s", out)
+		}
+	})
+	t.Run("protect-system", func(t *testing.T) {
+		if mountReadOnly(t, "/usr") {
+			t.Skip("宿主 /usr 已为只读挂载，无法验证 ProtectSystem")
+		}
+		out, err := exec.Command(systemdRun, "--user", "--wait", "--pipe", "--collect",
+			"-p", "ProtectSystem=full", "findmnt", "-no", "OPTIONS", "/usr").CombinedOutput()
+		if err != nil {
+			t.Skipf("宿主无法运行 ProtectSystem 探针: %v (%s)", err, strings.TrimSpace(string(out)))
+		}
+		if !strings.Contains(string(out), "ro") {
+			t.Fatalf("ProtectSystem 未把 /usr 置为只读: %s", out)
+		}
+	})
+}
+
 func TestStartCgroupIsolationFailsClosed(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -316,6 +386,8 @@ func TestStartCgroupIsolationFailsClosed(t *testing.T) {
 		{name: "private-network", isolation: processIsolation{privateNetwork: true}},
 		{name: "no-new-privileges", isolation: processIsolation{noNewPrivileges: true}},
 		{name: "private-tmp", isolation: processIsolation{privateTmp: true}},
+		{name: "protect-home", isolation: processIsolation{protectHome: true}},
+		{name: "protect-system", isolation: processIsolation{protectSystem: true}},
 		{name: "restrict-syscalls", isolation: processIsolation{restrictSyscalls: true}},
 		{name: "restrict-address-families", isolation: processIsolation{restrictAddressFamilies: true}},
 		{name: "capability-bounding-set", isolation: processIsolation{capabilityBoundingSet: []string{}}},

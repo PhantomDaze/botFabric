@@ -22,6 +22,15 @@ type managedPlugin struct {
 	sessionTTL time.Duration
 	state      HandshakeState
 	session    Session
+	// failureHandler 在外部进程异常退出时通知 Runtime 回滚插件资源。
+	failureHandler func(pluginID string, err error)
+	stopping       bool
+}
+
+// exitNotifier 由支持退出通知的 transport 实现。
+type exitNotifier interface {
+	Done() <-chan struct{}
+	ExitError() error
 }
 
 func (p *managedPlugin) Manifest() contract.Manifest {
@@ -95,7 +104,30 @@ func (p *managedPlugin) Start(ctx context.Context, host contract.Host) error {
 	p.session = session
 	p.state = HandshakeReady
 	p.mu.Unlock()
+	// 握手成功后监听进程退出，异常退出时回传 Runtime 迁移状态并回滚资源。
+	if notifier, ok := p.transport.(exitNotifier); ok && p.failureHandler != nil {
+		go p.watchExit(notifier)
+	}
 	return nil
+}
+
+// watchExit 等待 transport 终止信号；主动停止不触发失败回调。
+func (p *managedPlugin) watchExit(notifier exitNotifier) {
+	select {
+	case <-notifier.Done():
+	}
+	err := notifier.ExitError()
+	p.mu.Lock()
+	stopping := p.stopping || p.state == HandshakeStopped || p.state == HandshakeFailed
+	if !stopping {
+		p.state = HandshakeFailed
+	}
+	p.mu.Unlock()
+	if stopping || err == nil {
+		return
+	}
+	p.logger.Error("外部插件进程异常退出", "error", err)
+	p.failureHandler(p.manifest.ID, err)
 }
 
 func validateSession(session Session, pluginID string) error {
@@ -136,6 +168,9 @@ func (p *managedPlugin) Stop(ctx context.Context) error {
 	if state == HandshakeStopped || state == HandshakeCreated {
 		return nil
 	}
+	p.mu.Lock()
+	p.stopping = true
+	p.mu.Unlock()
 	if err := p.transport.Shutdown(ctx, session); err != nil {
 		if killErr := p.transport.Kill(); killErr != nil {
 			p.setState(HandshakeFailed)
@@ -150,6 +185,9 @@ func (p *managedPlugin) Stop(ctx context.Context) error {
 
 // ForceStop 由 Runtime 在 Stop 超时后调用。
 func (p *managedPlugin) ForceStop() error {
+	p.mu.Lock()
+	p.stopping = true
+	p.mu.Unlock()
 	err := p.transport.Kill()
 	p.setState(HandshakeStopped)
 	return err

@@ -122,6 +122,17 @@ func run() error {
 			fmt.Fprintln(os.Stderr, "address family probe: allowed")
 		}
 	}
+	if os.Getenv("BOTFABRIC_HELPER_PROBE_ENV") == "1" {
+		// 验证宿主秘密不会随环境继承泄漏到外部插件。
+		if _, leaked := os.LookupEnv("BOTFABRIC_CLASSIFIER_REAL_LLM_API_KEY"); leaked {
+			fmt.Fprintln(os.Stderr, "env probe: secret-leaked")
+		} else {
+			fmt.Fprintln(os.Stderr, "env probe: isolated")
+		}
+	}
+	if os.Getenv("BOTFABRIC_HELPER_PROBE_FILESYSTEM") == "1" {
+		probeFilesystemIsolation()
+	}
 	if marker := os.Getenv("BOTFABRIC_HELPER_PRIVATE_TMP_TMP_MARKER"); marker != "" {
 		_, tmpErr := os.Stat(marker)
 		varTmpMarker := os.Getenv("BOTFABRIC_HELPER_PRIVATE_TMP_VARTMP_MARKER")
@@ -370,4 +381,40 @@ func decode(value *structpb.Struct) (frame, error) {
 		return frame{}, errors.New("helper 收到缺少 type 的帧")
 	}
 	return result, nil
+}
+
+// probeFilesystemIsolation 验证 ProtectHome=yes 与 ProtectSystem=full 的实际效果。
+func probeFilesystemIsolation() {
+	entries, err := os.ReadDir("/home")
+	switch {
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "protect home probe: hidden: %v\n", err)
+	case len(entries) == 0:
+		fmt.Fprintln(os.Stderr, "protect home probe: empty")
+	default:
+		fmt.Fprintln(os.Stderr, "protect home probe: exposed")
+	}
+	if mountIsReadOnly("/usr") {
+		fmt.Fprintln(os.Stderr, "protect system probe: read-only")
+	} else {
+		fmt.Fprintln(os.Stderr, "protect system probe: writable")
+	}
+}
+
+func mountIsReadOnly(mountPoint string) bool {
+	content, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(content), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 5 && fields[4] == mountPoint {
+			for _, option := range strings.Split(fields[5], ",") {
+				if option == "ro" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
