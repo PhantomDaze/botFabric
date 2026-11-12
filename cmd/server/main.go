@@ -59,7 +59,7 @@ func runWithContext(ctx context.Context, configPath string, ready func()) error 
 		return fmt.Errorf("runtime 配置与策略文件的 policy.default 不一致")
 	}
 	reg := registry.New()
-	deadLetters := &eventbus.MemoryDeadLetterSink{}
+	deadLetters := eventbus.NewMemoryDeadLetterSink(0)
 	bus, err := eventbus.New(runtimeConfig.Runtime.DefaultHandlerTimeout.Duration, checker, logger, deadLetters)
 	if err != nil {
 		return err
@@ -78,6 +78,12 @@ func runWithContext(ctx context.Context, configPath string, ready func()) error 
 	)
 	if err != nil {
 		return err
+	}
+
+	var metrics *observability.Metrics
+	if runtimeConfig.Observability.MetricsEnabled {
+		metrics = observability.NewMetrics()
+		manager.SetMetrics(metrics)
 	}
 
 	// 分布式共享存储：启用 Redis 时去重与响应状态跨实例共享，进程死亡由 key TTL 兜底。
@@ -129,6 +135,8 @@ func runWithContext(ctx context.Context, configPath string, ready func()) error 
 	if err != nil {
 		return err
 	}
+	// 外部插件进程异常退出时由 Runtime 回滚其服务/订阅并置为 failed。
+	processLoader.SetFailureHandler(manager.NotifyPluginExit)
 	if err := manager.RegisterLoader(processLoader); err != nil {
 		return err
 	}
@@ -169,6 +177,7 @@ func runWithContext(ctx context.Context, configPath string, ready func()) error 
 			ReconnectInterval:    runtimeConfig.ApplicationOneBot.ReconnectInterval.Duration,
 			ReconnectMaxInterval: runtimeConfig.ApplicationOneBot.ReconnectMaxInterval.Duration,
 			ReconnectMaxTries:    runtimeConfig.ApplicationOneBot.ReconnectMaxTries,
+			MaxMessageSize:       int64(runtimeConfig.ApplicationOneBot.MaxMessageSize),
 		}, manager.Endpoints(), manager.ResponseCoordinator())
 		if err != nil {
 			_ = manager.StopAll(context.Background())
@@ -192,14 +201,39 @@ func runWithContext(ctx context.Context, configPath string, ready func()) error 
 			}
 		}
 	}
-	var managementServer *management.Server
-	if runtimeConfig.Management.Enabled {
-		managementServer, err = management.New(runtimeConfig.Management.ListenAddress, runtimeConfig.Management.BearerToken, manager, deadLetters)
+	var metricsServer *observability.MetricsServer
+	if metrics != nil {
+		metricsServer, err = observability.NewMetricsServer(runtimeConfig.Observability.MetricsListenAddress, metrics)
 		if err != nil {
 			_ = manager.StopAll(context.Background())
 			return err
 		}
+		if err := metricsServer.Start(); err != nil {
+			_ = manager.StopAll(context.Background())
+			return err
+		}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), runtimeConfig.Runtime.ShutdownTimeout.Duration)
+			defer cancel()
+			_ = metricsServer.Shutdown(shutdownCtx)
+		}()
+		logger.Info("指标端点已启动", "address", metricsServer.Addr())
+	}
+	var managementServer *management.Server
+	if runtimeConfig.Management.Enabled {
+		managementServer, err = management.New(runtimeConfig.Management.ListenAddress, runtimeConfig.Management.BearerToken, manager, deadLetters)
+		if err != nil {
+			if metricsServer != nil {
+				_ = metricsServer.Shutdown(context.Background())
+			}
+			_ = manager.StopAll(context.Background())
+			return err
+		}
 		if err := managementServer.Start(); err != nil {
+			if metricsServer != nil {
+				_ = metricsServer.Shutdown(context.Background())
+			}
 			_ = manager.StopAll(context.Background())
 			return err
 		}
