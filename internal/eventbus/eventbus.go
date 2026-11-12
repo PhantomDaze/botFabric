@@ -31,26 +31,136 @@ type DeadLetterSink interface {
 	Record(deadLetter DeadLetter)
 }
 
-// MemoryDeadLetterSink 是供 MVP 和测试使用的内存死信存储。
-type MemoryDeadLetterSink struct {
-	mu      sync.RWMutex
-	entries []DeadLetter
+const (
+	// defaultDeadLetterLimit 是内存死信存储的默认条数上限。
+	// 外部插件崩溃后事件会持续投递失败，必须有界存储，避免内存无界增长。
+	defaultDeadLetterLimit = 1024
+	// defaultDeadLetterBytes 是内存死信存储的默认累计字节上限。
+	defaultDeadLetterBytes = 8 << 20
+	// maxDeadLetterPayload 是单条死信保留的事件载荷上限；超出部分截断。
+	maxDeadLetterPayload = 4 << 10
+	// maxDeadLetterError 是单条死信错误摘要上限。
+	maxDeadLetterError = 1024
+)
+
+// safeDeadLetterHeaders 是允许保留在死信中的非敏感事件头。
+var safeDeadLetterHeaders = map[string]struct{}{
+	"trace_id":       {},
+	"correlation_id": {},
+	"dedup_key":      {},
+	"protocol":       {},
+	"bot_id":         {},
+	"endpoint_id":    {},
 }
 
-// Record 保存一条死信记录。
+// MemoryDeadLetterSink 是供 MVP 和测试使用的有界内存死信存储。
+type MemoryDeadLetterSink struct {
+	mu       sync.RWMutex
+	entries  []DeadLetter
+	limit    int
+	maxBytes int
+	bytes    int
+	dropped  uint64
+}
+
+// NewMemoryDeadLetterSink 创建按条数受限的内存死信存储；limit <= 0 使用默认上限。
+func NewMemoryDeadLetterSink(limit int) *MemoryDeadLetterSink {
+	return &MemoryDeadLetterSink{limit: limit}
+}
+
+// NewMemoryDeadLetterSinkWithLimits 创建同时受条数与累计字节约束的死信存储。
+func NewMemoryDeadLetterSinkWithLimits(limit, maxBytes int) *MemoryDeadLetterSink {
+	return &MemoryDeadLetterSink{limit: limit, maxBytes: maxBytes}
+}
+
+// Record 保存一条裁剪后的死信记录；超出条数或字节上限时淘汰最旧记录。
 func (s *MemoryDeadLetterSink) Record(deadLetter DeadLetter) {
+	deadLetter = trimDeadLetter(deadLetter)
+	size := deadLetterSize(deadLetter)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	limit := s.limit
+	if limit <= 0 {
+		limit = defaultDeadLetterLimit
+	}
+	maxBytes := s.maxBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultDeadLetterBytes
+	}
+	// 淘汰最旧记录，直到新记录可以放入或存储为空。
+	for len(s.entries) > 0 && (len(s.entries) >= limit || s.bytes+size > maxBytes) {
+		s.bytes -= deadLetterSize(s.entries[0])
+		s.entries = s.entries[1:]
+		s.dropped++
+	}
 	s.entries = append(s.entries, deadLetter)
+	s.bytes += size
 }
 
-// Entries 返回死信记录的副本。
+// Entries 返回全部死信记录的副本。
 func (s *MemoryDeadLetterSink) Entries() []DeadLetter {
+	return s.EntriesPage(0, 0)
+}
+
+// EntriesPage 返回分页后的死信记录副本；limit <= 0 表示不限制单页条数。
+func (s *MemoryDeadLetterSink) EntriesPage(offset, limit int) []DeadLetter {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	entries := make([]DeadLetter, len(s.entries))
-	copy(entries, s.entries)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(s.entries) {
+		return []DeadLetter{}
+	}
+	end := len(s.entries)
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	entries := make([]DeadLetter, end-offset)
+	copy(entries, s.entries[offset:end])
 	return entries
+}
+
+// Dropped 返回因容量上限被淘汰的死信数量。
+func (s *MemoryDeadLetterSink) Dropped() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.dropped
+}
+
+// trimDeadLetter 限制单条死信占用：截断载荷与错误摘要，只保留安全事件头。
+func trimDeadLetter(deadLetter DeadLetter) DeadLetter {
+	event := deadLetter.Event
+	if len(event.Payload) > maxDeadLetterPayload {
+		event.Payload = append([]byte(nil), event.Payload[:maxDeadLetterPayload]...)
+	} else {
+		event.Payload = append([]byte(nil), event.Payload...)
+	}
+	if len(event.Headers) > 0 {
+		headers := make(map[string]string)
+		for key, value := range event.Headers {
+			if _, safe := safeDeadLetterHeaders[key]; safe {
+				headers[key] = value
+			}
+		}
+		event.Headers = headers
+	}
+	deadLetter.Event = event
+	if len(deadLetter.Error) > maxDeadLetterError {
+		deadLetter.Error = deadLetter.Error[:maxDeadLetterError]
+	}
+	return deadLetter
+}
+
+// deadLetterSize 估算一条死信的常驻内存占用，用于字节上限淘汰。
+func deadLetterSize(deadLetter DeadLetter) int {
+	size := len(deadLetter.Event.ID) + len(deadLetter.Event.Topic) + len(deadLetter.Event.TraceID) +
+		len(deadLetter.Event.Schema) + len(deadLetter.Event.BotID) + len(deadLetter.Event.Payload) +
+		len(deadLetter.SubscriberID) + len(deadLetter.Error) + 128
+	for key, value := range deadLetter.Event.Headers {
+		size += len(key) + len(value)
+	}
+	return size
 }
 
 type subscription struct {
@@ -76,6 +186,7 @@ type Bus struct {
 	router         *routing.Router
 	responseHook   func(contract.Event, contract.ResponsePolicy)
 	sinks          []contract.EventSink
+	metrics        atomic.Pointer[observability.Metrics]
 }
 
 // New 创建事件总线。
@@ -100,6 +211,11 @@ func New(defaultTimeout time.Duration, checker policy.Checker, logger *slog.Logg
 		deadLetters:    deadLetters,
 		activity:       activity.NewTracker(),
 	}, nil
+}
+
+// SetMetrics 注入可选的运行时指标注册表。应在开始投递前调用。
+func (b *Bus) SetMetrics(metrics *observability.Metrics) {
+	b.metrics.Store(metrics)
 }
 
 // SetDeduplicator 配置可选的跨协议端事件去重器。
@@ -234,9 +350,16 @@ func (b *Bus) publish(ctx context.Context, publisher string, event contract.Even
 	if event.Topic == "" {
 		return &contract.ServiceError{Code: contract.ErrorInvalidArgument, Message: "事件 Topic 不能为空"}
 	}
+	metrics := b.metrics.Load()
 	if !b.policy.AllowPublish(publisher, event.Topic) {
+		if metrics != nil {
+			metrics.PublishDenied()
+		}
 		b.logger.Warn("拒绝未授权事件发布", "plugin_id", publisher, "topic", event.Topic)
 		return &contract.ServiceError{Code: contract.ErrorPermissionDenied, Message: "无权发布 Topic " + event.Topic}
+	}
+	if metrics != nil {
+		metrics.EventPublished()
 	}
 
 	ctx, traceID := observability.EnsureTraceID(ctx)
@@ -263,10 +386,16 @@ func (b *Bus) publish(ctx context.Context, publisher string, event contract.Even
 			return fmt.Errorf("事件去重失败: %w", err)
 		}
 		if duplicate && deduplicator.ShouldDrop(true) {
+			if metrics != nil {
+				metrics.DuplicateDropped()
+			}
 			b.logger.Debug("丢弃重复事件", "event_id", event.ID, "dedup_key", key, "topic", event.Topic)
 			return nil
 		}
 		if duplicate {
+			if metrics != nil {
+				metrics.DuplicateForwarded()
+			}
 			if event.Headers == nil {
 				event.Headers = make(map[string]string)
 			}
@@ -299,6 +428,9 @@ func (b *Bus) publish(ctx context.Context, publisher string, event contract.Even
 	if router != nil {
 		plan = router.Plan(ctx, event, candidateOwners)
 		if plan.Drop {
+			if metrics != nil {
+				metrics.RouteDropped()
+			}
 			b.logger.Debug("路由规则丢弃事件", "event_id", event.ID, "topic", event.Topic)
 			return nil
 		}
@@ -317,7 +449,7 @@ func (b *Bus) publish(ctx context.Context, publisher string, event contract.Even
 	}
 	for _, sink := range sinkTargets {
 		if err := sink.Deliver(ctx, cloneEvent(event), plan.Targets); err != nil {
-			b.deadLetters.Record(DeadLetter{Event: cloneEvent(event), SubscriberID: "event-sink", Error: err.Error(), FailedAt: time.Now().UTC()})
+			b.recordDeadLetter(DeadLetter{Event: cloneEvent(event), SubscriberID: "event-sink", Error: err.Error(), FailedAt: time.Now().UTC()})
 		}
 	}
 
@@ -363,7 +495,7 @@ func (b *Bus) publish(ctx context.Context, publisher string, event contract.Even
 	var joined []error
 	for failure := range failures {
 		joined = append(joined, fmt.Errorf("订阅者 %s: %w", failure.candidate.owner, failure.err))
-		b.deadLetters.Record(DeadLetter{
+		b.recordDeadLetter(DeadLetter{
 			Event:        cloneEvent(event),
 			SubscriberID: failure.candidate.owner,
 			Error:        failure.err.Error(),
@@ -371,6 +503,27 @@ func (b *Bus) publish(ctx context.Context, publisher string, event contract.Even
 		})
 	}
 	return errors.Join(joined...)
+}
+
+// recordDeadLetter 保存死信并同步计数。
+func (b *Bus) recordDeadLetter(deadLetter DeadLetter) {
+	b.deadLetters.Record(deadLetter)
+	if metrics := b.metrics.Load(); metrics != nil {
+		metrics.DeadLetter()
+	}
+}
+
+// recordDelivery 记录一次订阅者投递结果。
+func (b *Bus) recordDelivery(err error) {
+	metrics := b.metrics.Load()
+	if metrics == nil {
+		return
+	}
+	if err != nil {
+		metrics.DeliveryFailed()
+		return
+	}
+	metrics.DeliveryCompleted()
 }
 
 func (b *Bus) snapshot(topic string) []subscription {
@@ -384,7 +537,9 @@ func (b *Bus) snapshot(topic string) []subscription {
 func (b *Bus) deliver(parent context.Context, candidate subscription, event contract.Event) (err error) {
 	done, accepted := b.activity.Begin(candidate.owner)
 	if !accepted {
-		return &contract.ServiceError{Code: contract.ErrorUnavailable, Message: "订阅者已停止接收新事件"}
+		err := &contract.ServiceError{Code: contract.ErrorUnavailable, Message: "订阅者已停止接收新事件"}
+		b.recordDelivery(err)
+		return err
 	}
 	ctx, cancel := context.WithTimeout(parent, candidate.timeout)
 	defer cancel()
@@ -402,8 +557,10 @@ func (b *Bus) deliver(parent context.Context, candidate subscription, event cont
 
 	select {
 	case err = <-completed:
+		b.recordDelivery(err)
 		return err
 	case <-ctx.Done():
+		b.recordDelivery(ctx.Err())
 		return ctx.Err()
 	}
 }

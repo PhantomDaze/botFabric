@@ -14,7 +14,8 @@ policy:
 
 observability:
   log_format: json
-  metrics_enabled: true
+  metrics_enabled: false # 启用后通过独立 HTTP 端点暴露 Prometheus 指标
+  metrics_listen_address: 127.0.0.1:9091 # 启用指标时必填；建议仅绑定回环或内网地址
   tracing_enabled: false
 
 onebot:
@@ -44,6 +45,7 @@ application_onebot:
   reconnect_interval: 2s # 0 表示不自动重连；>0 启用指数退避
   reconnect_max_interval: 16s
   reconnect_max_tries: 0 # 0 表示无限重连
+  max_message_size: 4MiB # 单条读消息上限，超过则断开连接；默认 4MiB，最大 64MiB
 
 redis:
   enabled: false # 关闭时去重与响应状态回退到进程内内存实现

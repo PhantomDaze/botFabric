@@ -103,9 +103,10 @@ type PolicyConfig struct {
 
 // ObservabilityConfig 控制日志、指标和追踪。
 type ObservabilityConfig struct {
-	LogFormat      string `yaml:"log_format"`
-	MetricsEnabled bool   `yaml:"metrics_enabled"`
-	TracingEnabled bool   `yaml:"tracing_enabled"`
+	LogFormat            string `yaml:"log_format"`
+	MetricsEnabled       bool   `yaml:"metrics_enabled"`
+	MetricsListenAddress string `yaml:"metrics_listen_address"`
+	TracingEnabled       bool   `yaml:"tracing_enabled"`
 }
 
 // Load 以严格模式加载运行时配置。
@@ -170,6 +171,9 @@ func (c Config) Validate() error {
 	}
 	if c.Observability.LogFormat != "json" && c.Observability.LogFormat != "text" {
 		return errors.New("observability.log_format 仅支持 json 或 text")
+	}
+	if c.Observability.MetricsEnabled && c.Observability.MetricsListenAddress == "" {
+		return errors.New("observability.metrics_listen_address 在启用指标时不能为空")
 	}
 	if err := c.OneBot.Validate(); err != nil {
 		return err

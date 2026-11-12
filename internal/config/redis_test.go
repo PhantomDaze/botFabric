@@ -21,6 +21,7 @@ policy:
 observability:
   log_format: json
   metrics_enabled: true
+  metrics_listen_address: 127.0.0.1:0
   tracing_enabled: false
 onebot:
   enabled: true

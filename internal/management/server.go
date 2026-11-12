@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,13 +98,38 @@ func (s *Server) handlePlugins(writer http.ResponseWriter, request *http.Request
 	writeJSON(writer, s.manager.ListPlugins(request.Context()))
 }
 
-func (s *Server) handleDeadLetters(writer http.ResponseWriter, _ *http.Request) {
-	entries := s.deadLetters.Entries()
+const (
+	// defaultDeadLetterPageSize 是管理 API 单页默认条数。
+	defaultDeadLetterPageSize = 100
+	// maxDeadLetterPageSize 是管理 API 单页条数硬上限，避免一次复制和序列化整个存储。
+	maxDeadLetterPageSize = 200
+)
+
+func (s *Server) handleDeadLetters(writer http.ResponseWriter, request *http.Request) {
+	offset, limit := deadLetterPageParams(request)
+	entries := s.deadLetters.EntriesPage(offset, limit)
 	result := make([]map[string]any, 0, len(entries))
 	for _, entry := range entries {
 		result = append(result, map[string]any{"event_id": entry.Event.ID, "topic": entry.Event.Topic, "trace_id": entry.Event.TraceID, "subscriber_id": entry.SubscriberID, "error": entry.Error, "failed_at": entry.FailedAt})
 	}
 	writeJSON(writer, result)
+}
+
+// deadLetterPageParams 解析并收紧分页参数，非法值回退默认值。
+func deadLetterPageParams(request *http.Request) (int, int) {
+	query := request.URL.Query()
+	offset, err := strconv.Atoi(query.Get("offset"))
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+	limit, err := strconv.Atoi(query.Get("limit"))
+	if err != nil || limit <= 0 {
+		limit = defaultDeadLetterPageSize
+	}
+	if limit > maxDeadLetterPageSize {
+		limit = maxDeadLetterPageSize
+	}
+	return offset, limit
 }
 
 func writeJSON(writer http.ResponseWriter, value any) {
