@@ -4,12 +4,14 @@
 package onebotapp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,7 +57,21 @@ type Config struct {
 	ReconnectInterval    time.Duration // client/both 重连基础间隔；0 表示不重连（失败即返回）
 	ReconnectMaxInterval time.Duration // 指数退避上限；0 表示缺省=ReconnectInterval*8
 	ReconnectMaxTries    int           // 最大重连次数；0 表示无限
+	PendingTTL           time.Duration // 未回复事件保留时长；0 表示使用默认值
+	MaxPending           int           // 单连接未回复事件上限；0 表示使用默认值
+	MaxMessageSize       int64         // 单条读消息上限字节；0 表示使用默认值
 }
+
+const (
+	// defaultPendingTTL 是未回复事件的默认保留时长。
+	defaultPendingTTL = 5 * time.Minute
+	// defaultMaxPending 是单连接未回复事件的默认上限，防止长期在线但只回复部分消息的应用端无界增长。
+	defaultMaxPending = 1024
+	// defaultMaxMessageSize 是应用端单条 WebSocket 消息的默认读上限，防止超大帧撑爆内存。
+	defaultMaxMessageSize = 4 << 20
+	// maxApplicationMessageSize 是允许配置的读消息上限最大值。
+	maxApplicationMessageSize = 64 << 20
+)
 
 // Validate 校验应用端 OneBot 配置。
 func (c Config) Validate() error {
@@ -86,6 +102,12 @@ func (c Config) Validate() error {
 	}
 	if c.ReadTimeout <= 0 || c.WriteTimeout <= 0 {
 		return errors.New("应用端 OneBot 读写超时必须大于零")
+	}
+	if c.MaxMessageSize < 0 {
+		return errors.New("应用端 OneBot max message size 不能为负数")
+	}
+	if c.MaxMessageSize > maxApplicationMessageSize {
+		return errors.New("应用端 OneBot max message size 超过允许上限 (64MiB)")
 	}
 	return nil
 }
@@ -118,6 +140,15 @@ func New(config Config, endpoints *endpoint.Registry, submitter CandidateReplySu
 	}
 	if err := config.Validate(); err != nil {
 		return nil, err
+	}
+	if config.PendingTTL <= 0 {
+		config.PendingTTL = defaultPendingTTL
+	}
+	if config.MaxPending <= 0 {
+		config.MaxPending = defaultMaxPending
+	}
+	if config.MaxMessageSize <= 0 {
+		config.MaxMessageSize = defaultMaxMessageSize
 	}
 	return &Adapter{config: config, endpoints: endpoints, submitter: submitter, conns: make(map[string]*connection)}, nil
 }
@@ -301,12 +332,18 @@ func (a *Adapter) Candidates() []string {
 	return result
 }
 
+// connTarget 是连接 ID 与连接对象的快照，避免锁外读取会被 adoptIdentity 改写的 c.id。
+type connTarget struct {
+	id   string
+	conn *connection
+}
+
 // Deliver 将事件投递给匹配的应用端连接。
 func (a *Adapter) Deliver(ctx context.Context, event contract.Event, targets []string) error {
 	a.connMu.RLock()
-	connections := make([]*connection, 0, len(a.conns))
-	for _, conn := range a.conns {
-		connections = append(connections, conn)
+	connections := make([]connTarget, 0, len(a.conns))
+	for id, conn := range a.conns {
+		connections = append(connections, connTarget{id: id, conn: conn})
 	}
 	a.connMu.RUnlock()
 	selected := make(map[string]struct{}, len(targets))
@@ -315,13 +352,13 @@ func (a *Adapter) Deliver(ctx context.Context, event contract.Event, targets []s
 	}
 	delivered := 0
 	var failures []error
-	for _, conn := range connections {
+	for _, target := range connections {
 		if len(selected) > 0 {
-			if _, ok := selected[conn.id]; !ok {
+			if _, ok := selected[target.id]; !ok {
 				continue
 			}
 		}
-		if err := conn.Deliver(ctx, event); err != nil {
+		if err := target.conn.Deliver(ctx, event); err != nil {
 			failures = append(failures, err)
 			continue
 		}
@@ -379,42 +416,52 @@ func validBearer(value, expected string) bool {
 
 // pendingEntry 记录一个待回复事件及其所属群，用于缺关联回复的同群 fallback 关联。
 type pendingEntry struct {
-	event   contract.Event
-	groupID string
+	event     contract.Event
+	groupID   string
+	createdAt time.Time
 }
 
 type connection struct {
-	adapter   *Adapter
-	version   string
-	id        string
-	ws        *wsconn.Conn
-	dead      chan struct{}
-	pendingMu sync.Mutex
-	pending   map[string]pendingEntry // eventID -> entry（显式关联 O(1) 查）
-	recent    []string                // eventID 按推送顺序，仅用于 fallback 逆序取最近未决
+	adapter    *Adapter
+	version    string
+	id         string
+	ws         *wsconn.Conn
+	dead       chan struct{}
+	pendingMu  sync.Mutex
+	pending    map[string]pendingEntry // eventID -> entry（显式关联 O(1) 查）
+	recent     []string                // eventID 按推送顺序，仅用于 fallback 逆序取最近未决
+	pendingTTL time.Duration           // 未回复事件保留时长
+	maxPending int                     // 未回复事件容量上限
 }
 
 func newConnection(adapter *Adapter, version string, socket *websocket.Conn) *connection {
 	ws := wsconn.New(socket, wsconn.Options{
 		HeartbeatInterval: adapter.config.HeartbeatInterval,
 		WriteTimeout:      adapter.config.WriteTimeout,
+		MaxMessageSize:    adapter.config.MaxMessageSize,
 	})
-	return &connection{adapter: adapter, version: version, id: fmt.Sprintf("%s-%d", version, time.Now().UnixNano()), ws: ws, dead: make(chan struct{}), pending: make(map[string]pendingEntry)}
+	return &connection{adapter: adapter, version: version, id: fmt.Sprintf("%s-%d", version, time.Now().UnixNano()), ws: ws, dead: make(chan struct{}), pending: make(map[string]pendingEntry), pendingTTL: adapter.config.PendingTTL, maxPending: adapter.config.MaxPending}
 }
 
 func (c *connection) run() {
-	c.registerEndpoint()
 	defer func() {
+		id := c.endpointID()
 		c.adapter.connMu.Lock()
-		delete(c.adapter.conns, c.id)
+		delete(c.adapter.conns, id)
 		c.adapter.connMu.Unlock()
-		_ = c.adapter.endpoints.Unregister(c.id)
+		_ = c.adapter.endpoints.Unregister(id)
 		_ = c.ws.Close(websocket.CloseNormalClosure, "closed")
 		c.ws.RunDone()
 		close(c.dead)
 	}()
+	if err := c.registerEndpoint(); err != nil {
+		// 端点无法注册时不接收任何消息，直接进入清理流程。
+		return
+	}
 	stopKeepalive := c.ws.StartKeepalive()
 	defer stopKeepalive()
+	stopPendingCleanup := c.startPendingCleanup()
+	defer stopPendingCleanup()
 	for {
 		_, payload, err := c.ws.ReadMessage()
 		if err != nil {
@@ -428,35 +475,74 @@ func (c *connection) run() {
 
 // registerEndpoint 把连接注册为 application 端点。
 // 若应用端声明了稳定身份（__botfabric_endpoint_id 或 self_id），复用该 ID：
-// 已存在则用 Update 刷新元数据，使重连后路由与响应状态可关联。
-func (c *connection) registerEndpoint() {
-	info := contract.EndpointInfo{ID: c.id, Owner: PluginID, Kind: contract.EndpointApplication, Protocol: "onebot", Version: c.version, ConnectionID: c.id, Capabilities: []string{"receive_event", "submit_reply"}}
+// 已存在且属于本插件时用 Update 刷新元数据，使重连后路由与响应状态可关联。
+// 属于其他 owner 的端点一律不覆盖。
+func (c *connection) registerEndpoint() error {
+	id := c.endpointID()
+	info := contract.EndpointInfo{ID: id, Owner: PluginID, Kind: contract.EndpointApplication, Protocol: "onebot", Version: c.version, ConnectionID: id, Capabilities: []string{"receive_event", "submit_reply"}}
 	if err := c.adapter.endpoints.Register(info); err == nil {
-		return
+		return nil
+	}
+	existing, exists := c.adapter.endpoints.Get(id)
+	if !exists {
+		// 注册失败但端点已消失（并发注销），无需覆盖。
+		return nil
+	}
+	if existing.Owner != PluginID {
+		return fmt.Errorf("端点 %s 已由 %s 拥有，拒绝覆盖", id, existing.Owner)
 	}
 	// ID 已存在（重连复用稳定身份）：刷新元数据。
-	_ = c.adapter.endpoints.Update(info)
+	return c.adapter.endpoints.Update(info)
 }
 
 // adoptIdentity 采用应用端声明的稳定身份：注销旧端点、迁移连接表键、注册新端点。
 // 仅在身份与当前 ID 不同时执行；幂等。
 func (c *connection) adoptIdentity(stableID string) {
-	if stableID == "" || stableID == c.id {
+	// 稳定身份必须位于应用端保留命名空间，禁止声明插件 ID 或其他受信主体。
+	if !validApplicationIdentity(stableID) {
 		return
 	}
-	oldID := c.id
+	if info, exists := c.adapter.endpoints.Get(stableID); exists && info.Owner != PluginID {
+		// 该端点已被其他 owner 注册：不得冒用。
+		return
+	}
 	c.adapter.connMu.Lock()
+	oldID := c.id
+	if stableID == "" || stableID == oldID {
+		c.adapter.connMu.Unlock()
+		return
+	}
 	if _, exists := c.adapter.conns[stableID]; exists && stableID != oldID {
 		// 稳定 ID 已被占用且非自身：放弃采用，避免冲突。
 		c.adapter.connMu.Unlock()
 		return
 	}
+	// 连接表键与 c.id 必须在同一临界区内更新，供 Deliver 等并发读取方一致观测。
 	c.adapter.conns[stableID] = c
 	delete(c.adapter.conns, oldID)
+	c.id = stableID
 	c.adapter.connMu.Unlock()
 	_ = c.adapter.endpoints.Unregister(oldID)
-	c.id = stableID
-	c.registerEndpoint()
+	_ = c.registerEndpoint()
+}
+
+// applicationIdentityPrefix 是应用端稳定身份的保留命名空间。
+const applicationIdentityPrefix = "app:"
+
+// validApplicationIdentity 只接受应用端命名空间内的非空身份，
+// 保证客户端无法声明插件 ID 或其他内部主体。
+func validApplicationIdentity(id string) bool {
+	if strings.TrimSpace(id) != id || !strings.HasPrefix(id, applicationIdentityPrefix) {
+		return false
+	}
+	return len(strings.TrimPrefix(id, applicationIdentityPrefix)) > 0
+}
+
+// endpointID 返回当前端点 ID 的快照；所有锁外读取 c.id 都应经由此方法。
+func (c *connection) endpointID() string {
+	c.adapter.connMu.RLock()
+	defer c.adapter.connMu.RUnlock()
+	return c.id
 }
 
 func (c *connection) handle(payload []byte) error {
@@ -468,7 +554,10 @@ func (c *connection) handle(payload []byte) error {
 		EndpointID string `json:"__botfabric_endpoint_id"`
 		SelfID     string `json:"self_id"`
 	}
-	if err := json.Unmarshal(payload, &envelope); err != nil {
+	// UseNumber 保留 JSON 数字的原始文本，避免大整数群号被格式化成科学计数法。
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&envelope); err != nil {
 		return fmt.Errorf("解析应用端 OneBot 消息: %w", err)
 	}
 	// 可选身份声明：应用端可在任意帧携带 __botfabric_endpoint_id/self_id 声明稳定身份。
@@ -515,7 +604,13 @@ func (c *connection) handle(payload []byte) error {
 	if eventID == "" || !ok || entry.event.ID == "" {
 		return errors.New("应用端回复缺少有效的 event_id/echo 关联，且无可用的最近未决事件")
 	}
-	result, err := c.adapter.submitter.Submit(context.Background(), contract.CandidateReply{EventID: entry.event.ID, ApplicationID: c.id, GroupID: groupID, Text: text})
+	result, err := c.adapter.submitter.Submit(context.Background(), contract.CandidateReply{
+		EventID:         entry.event.ID,
+		ApplicationID:   c.endpointID(),
+		GroupID:         groupID,
+		Text:            text,
+		DispatchSubject: response.ApplicationDispatchSubject,
+	})
 	if err != nil {
 		// fallback 命中但事件已被协调器过期释放：清除残留 entry，避免后续同群 fallback 反复命中陈旧事件。
 		if fromFallback {
@@ -568,8 +663,12 @@ func (c *connection) Deliver(_ context.Context, event contract.Event) error {
 	if err := json.Unmarshal(event.Payload, &message); err != nil {
 		return err
 	}
+	now := time.Now()
 	c.pendingMu.Lock()
-	c.pending[event.ID] = pendingEntry{event: event, groupID: message.GroupID}
+	c.prunePendingLocked(now)
+	for c.maxPending > 0 && len(c.pending) >= c.maxPending && c.evictOldestLocked() {
+	}
+	c.pending[event.ID] = pendingEntry{event: event, groupID: message.GroupID, createdAt: now}
 	c.recent = append(c.recent, event.ID)
 	c.pendingMu.Unlock()
 	var envelope any
@@ -578,7 +677,66 @@ func (c *connection) Deliver(_ context.Context, event contract.Event) error {
 	} else {
 		envelope = map[string]any{"time": event.Timestamp.Unix(), "type": "message", "detail_type": "group", "id": message.MessageID, "group_id": message.GroupID, "user_id": message.UserID, "message": []map[string]any{{"type": "text", "data": map[string]string{"text": message.Text}}}, "alt_message": message.Text, "__botfabric_event_id": event.ID}
 	}
-	return c.writeJSON(envelope)
+	if err := c.writeJSON(envelope); err != nil {
+		// 写入失败的事件不会被应用端看到，回滚登记避免其永久驻留。
+		c.pendingMu.Lock()
+		delete(c.pending, event.ID)
+		c.removeRecent(event.ID)
+		c.pendingMu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// startPendingCleanup 启动按 TTL 清理未回复事件的后台协程，返回停止函数。
+func (c *connection) startPendingCleanup() func() {
+	interval := c.pendingTTL / 2
+	if interval <= 0 {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case now := <-ticker.C:
+				c.pendingMu.Lock()
+				c.prunePendingLocked(now)
+				c.pendingMu.Unlock()
+			}
+		}
+	}()
+	return func() { close(done) }
+}
+
+// prunePendingLocked 删除超过 TTL 的未回复事件。调用方须持有 pendingMu。
+func (c *connection) prunePendingLocked(now time.Time) {
+	if c.pendingTTL <= 0 {
+		return
+	}
+	cutoff := now.Add(-c.pendingTTL)
+	for id, entry := range c.pending {
+		if entry.createdAt.Before(cutoff) {
+			delete(c.pending, id)
+			c.removeRecent(id)
+		}
+	}
+}
+
+// evictOldestLocked 按推送顺序淘汰最早登记的未回复事件。调用方须持有 pendingMu。
+func (c *connection) evictOldestLocked() bool {
+	for len(c.recent) > 0 {
+		id := c.recent[0]
+		c.recent = c.recent[1:]
+		if _, ok := c.pending[id]; ok {
+			delete(c.pending, id)
+			return true
+		}
+	}
+	return false
 }
 
 func (c *connection) writeJSON(value any) error {
@@ -594,10 +752,18 @@ func stringParam(params map[string]any, key string) string {
 	if !ok {
 		return ""
 	}
-	if text, ok := value.(string); ok {
-		return text
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case json.Number:
+		// UseNumber 解码后数字保留原始文本，大整数群号不会变成科学计数法。
+		return typed.String()
+	case float64:
+		// 兜底：未经 UseNumber 的数值按整数格式化。
+		return strconv.FormatInt(int64(typed), 10)
+	default:
+		return fmt.Sprint(value)
 	}
-	return fmt.Sprint(value)
 }
 
 func stringValue(raw json.RawMessage) string {

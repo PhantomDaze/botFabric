@@ -74,3 +74,27 @@ func TestApplicationOneBotReconnectValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestApplicationOneBotMaxMessageSizeValidation 验证应用端读消息上限的边界校验：
+// 未配置(0)由适配器补默认值，允许到 64MiB，超过上限或负数被拒绝。
+func TestApplicationOneBotMaxMessageSizeValidation(t *testing.T) {
+	base := validApplicationOneBotConfig("server")
+	if err := base.Validate(); err != nil {
+		t.Fatalf("未配置 max_message_size 应合法: %v", err)
+	}
+	atLimit := validApplicationOneBotConfig("server")
+	atLimit.MaxMessageSize = MaxApplicationMessageSize
+	if err := atLimit.Validate(); err != nil {
+		t.Fatalf("等于上限应合法: %v", err)
+	}
+	overLimit := validApplicationOneBotConfig("server")
+	overLimit.MaxMessageSize = MaxApplicationMessageSize + 1
+	if err := overLimit.Validate(); err == nil {
+		t.Fatal("超过 64MiB 应被拒绝")
+	}
+	negative := validApplicationOneBotConfig("server")
+	negative.MaxMessageSize = -1
+	if err := negative.Validate(); err == nil {
+		t.Fatal("负数 max_message_size 应被拒绝")
+	}
+}

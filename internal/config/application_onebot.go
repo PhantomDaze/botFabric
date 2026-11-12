@@ -2,6 +2,13 @@ package config
 
 import "errors"
 
+const (
+	// DefaultApplicationMaxMessageSize 是应用端 OneBot 单条消息的默认读上限。
+	DefaultApplicationMaxMessageSize ByteSize = 4 << 20
+	// MaxApplicationMessageSize 是应用端 OneBot 单条消息读上限的允许最大值。
+	MaxApplicationMessageSize ByteSize = 64 << 20
+)
+
 // ApplicationOneBotConfig 控制应用端 OneBot 服务端和客户端接入。
 type ApplicationOneBotConfig struct {
 	Enabled              bool     `yaml:"enabled"`
@@ -19,6 +26,7 @@ type ApplicationOneBotConfig struct {
 	ReconnectInterval    Duration `yaml:"reconnect_interval"`
 	ReconnectMaxInterval Duration `yaml:"reconnect_max_interval"`
 	ReconnectMaxTries    int      `yaml:"reconnect_max_tries"`
+	MaxMessageSize       ByteSize `yaml:"max_message_size"`
 }
 
 // Validate 检查应用端 OneBot 配置。
@@ -64,6 +72,13 @@ func (c ApplicationOneBotConfig) Validate() error {
 	}
 	if c.ReconnectInterval.Duration > 0 && c.ReconnectMaxInterval.Duration > 0 && c.ReconnectMaxInterval.Duration < c.ReconnectInterval.Duration {
 		return errors.New("application_onebot reconnect_max_interval 不能小于 reconnect_interval")
+	}
+	// 读消息上限：0 由适配器补默认值；负数与超过上限的值非法。
+	if c.MaxMessageSize < 0 {
+		return errors.New("application_onebot max_message_size 不能为负数")
+	}
+	if c.MaxMessageSize > MaxApplicationMessageSize {
+		return errors.New("application_onebot max_message_size 超过允许上限 (64MiB)")
 	}
 	return nil
 }

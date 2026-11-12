@@ -3,6 +3,7 @@ package onebotapp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -91,6 +92,9 @@ func testRoundTrip(t *testing.T, version string) {
 	case reply := <-submitter.replies:
 		if reply.EventID != "event-1" || reply.ApplicationID != connection.id || reply.GroupID != "group-1" || reply.Text != "回复" {
 			t.Fatalf("候选回复错误: %#v", reply)
+		}
+		if reply.DispatchSubject != response.ApplicationDispatchSubject {
+			t.Fatalf("动作调用主体 = %q，期望固定主体 %q", reply.DispatchSubject, response.ApplicationDispatchSubject)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("候选回复提交超时")
@@ -325,13 +329,13 @@ func TestServerIdentityPreservedAcrossReconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = socket1.WriteJSON(map[string]any{"action": "send_group_msg", "params": map[string]any{"group_id": "g", "message": "x"}, "__botfabric_endpoint_id": "stable-app-1"})
+	_ = socket1.WriteJSON(map[string]any{"action": "send_group_msg", "params": map[string]any{"group_id": "g", "message": "x"}, "__botfabric_endpoint_id": "app:stable-app-1"})
 	// 等待身份采用。
-	waitForConnID(t, adapter, "stable-app-1")
+	waitForConnID(t, adapter, "app:stable-app-1")
 
 	// 断开第一次连接。
 	_ = socket1.Close()
-	waitForConnGone(t, adapter, "stable-app-1")
+	waitForConnGone(t, adapter, "app:stable-app-1")
 
 	// 第二次连入并声明同一身份。
 	socket2, _, err := websocket.DefaultDialer.Dial(u.String(), header)
@@ -339,11 +343,11 @@ func TestServerIdentityPreservedAcrossReconnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer socket2.Close()
-	_ = socket2.WriteJSON(map[string]any{"action": "send_group_msg", "params": map[string]any{"group_id": "g", "message": "y"}, "__botfabric_endpoint_id": "stable-app-1"})
-	waitForConnID(t, adapter, "stable-app-1")
+	_ = socket2.WriteJSON(map[string]any{"action": "send_group_msg", "params": map[string]any{"group_id": "g", "message": "y"}, "__botfabric_endpoint_id": "app:stable-app-1"})
+	waitForConnID(t, adapter, "app:stable-app-1")
 
 	// 端点注册表应包含该稳定 ID。
-	info, ok := adapter.endpoints.Get("stable-app-1")
+	info, ok := adapter.endpoints.Get("app:stable-app-1")
 	if !ok {
 		t.Fatal("重连后端点未以稳定 ID 注册")
 	}
@@ -533,5 +537,447 @@ func TestFallbackNoUndeliveredReturnsError(t *testing.T) {
 	case <-submitter.replies:
 		t.Fatal("无未决事件时不应提交候选回复")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestNumericGroupIDPreservedInCandidateReply 验证应用端以数字形式提交大群号时，
+// 候选回复保留精确群号而非科学计数法（回归：float64 的 %g 输出 1.23456789e+08）。
+func TestNumericGroupIDPreservedInCandidateReply(t *testing.T) {
+	submitter := &submitter{replies: make(chan contract.CandidateReply, 1)}
+	adapter, err := New(testConfig(), endpoint.New(), submitter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Shutdown(context.Background())
+	u, _ := url.Parse("ws://" + adapter.Addr() + "/v11")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	socket, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	waitConnection(t, adapter)
+	deliverEvent(t, adapter, "evt-numeric", "123456789")
+	_ = socket.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := socket.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	action := map[string]any{"action": "send_group_msg", "params": map[string]any{
+		"group_id":             123456789,
+		"message":              "回复",
+		"__botfabric_event_id": "evt-numeric",
+	}}
+	if err := socket.WriteJSON(action); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case reply := <-submitter.replies:
+		if reply.GroupID != "123456789" || reply.EventID != "evt-numeric" {
+			t.Fatalf("数字群号未精确保留: %#v", reply)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("候选回复提交超时")
+	}
+}
+
+// TestNumericGroupIDFallbackMatchesEvent 验证数字群号参与的 fallback 同群关联：
+// 推送事件的群号是字符串 "123456789"，应用端以数字提交时必须命中。
+func TestNumericGroupIDFallbackMatchesEvent(t *testing.T) {
+	submitter := &submitter{replies: make(chan contract.CandidateReply, 1)}
+	adapter, err := New(testConfig(), endpoint.New(), submitter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Shutdown(context.Background())
+	u, _ := url.Parse("ws://" + adapter.Addr() + "/v11")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	socket, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	waitConnection(t, adapter)
+	deliverEvent(t, adapter, "evt-numeric-fallback", "123456789")
+	_ = socket.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := socket.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	// 不带 event_id/echo，仅以数字群号走同群 fallback。
+	action := map[string]any{"action": "send_group_msg", "params": map[string]any{
+		"group_id": 123456789,
+		"message":  "回复",
+	}}
+	if err := socket.WriteJSON(action); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case reply := <-submitter.replies:
+		if reply.EventID != "evt-numeric-fallback" || reply.GroupID != "123456789" {
+			t.Fatalf("数字群号 fallback 关联错误: %#v", reply)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fallback 候选回复提交超时")
+	}
+}
+
+// TestPendingBoundedByMaxPending 验证未回复事件不会超过容量上限。
+func TestPendingBoundedByMaxPending(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxPending = 3
+	cfg.PendingTTL = time.Minute
+	adapter, err := New(cfg, endpoint.New(), &submitter{replies: make(chan contract.CandidateReply, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Shutdown(context.Background())
+	u, _ := url.Parse("ws://" + adapter.Addr() + "/v11")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	socket, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	// 持续消费推送信封，避免写缓冲阻塞。
+	go func() {
+		for {
+			if _, _, err := socket.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+	conn := waitConnection(t, adapter)
+	for i := 0; i < 10; i++ {
+		deliverEvent(t, adapter, fmt.Sprintf("evt-cap-%d", i), "group-cap")
+	}
+	conn.pendingMu.Lock()
+	defer conn.pendingMu.Unlock()
+	if len(conn.pending) != cfg.MaxPending {
+		t.Fatalf("pending 数量 = %d，期望上限 %d", len(conn.pending), cfg.MaxPending)
+	}
+	// 应保留最近的 3 条，最早的被淘汰。
+	for i := 0; i < 7; i++ {
+		if _, ok := conn.pending[fmt.Sprintf("evt-cap-%d", i)]; ok {
+			t.Fatalf("最早的事件 %d 未被淘汰", i)
+		}
+	}
+	for i := 7; i < 10; i++ {
+		if _, ok := conn.pending[fmt.Sprintf("evt-cap-%d", i)]; !ok {
+			t.Fatalf("最近的事件 %d 不应被淘汰", i)
+		}
+	}
+	// recent 与 pending 同步收敛，保证 fallback 扫描不会随历史事件无界增长。
+	if len(conn.recent) != cfg.MaxPending {
+		t.Fatalf("recent 数量 = %d，期望上限 %d", len(conn.recent), cfg.MaxPending)
+	}
+}
+
+// TestPendingExpiresAfterTTL 验证长时间无回复的事件会按 TTL 清理。
+func TestPendingExpiresAfterTTL(t *testing.T) {
+	cfg := testConfig()
+	cfg.PendingTTL = 40 * time.Millisecond
+	cfg.MaxPending = 100
+	adapter, err := New(cfg, endpoint.New(), &submitter{replies: make(chan contract.CandidateReply, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Shutdown(context.Background())
+	u, _ := url.Parse("ws://" + adapter.Addr() + "/v11")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	socket, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	go func() {
+		for {
+			if _, _, err := socket.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+	conn := waitConnection(t, adapter)
+	deliverEvent(t, adapter, "evt-ttl", "group-ttl")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		conn.pendingMu.Lock()
+		count := len(conn.pending)
+		recentCount := len(conn.recent)
+		conn.pendingMu.Unlock()
+		if count == 0 {
+			if recentCount != 0 {
+				t.Fatalf("TTL 清理后 recent 数量 = %d，期望 0", recentCount)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("超时后 pending 仍未被 TTL 清理")
+}
+
+// TestDeliverWriteFailureRollsBackPending 验证推送写入失败的事件不会留在 pending 中。
+func TestDeliverWriteFailureRollsBackPending(t *testing.T) {
+	adapter, err := New(testConfig(), endpoint.New(), &submitter{replies: make(chan contract.CandidateReply, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Shutdown(context.Background())
+	u, _ := url.Parse("ws://" + adapter.Addr() + "/v11")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	socket, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := waitConnection(t, adapter)
+	_ = socket.Close()
+	select {
+	case <-conn.dead:
+	case <-time.After(2 * time.Second):
+		t.Fatal("连接未在超时内关闭")
+	}
+	payload, _ := json.Marshal(contract.GroupMessage{MessageID: "m-fail", GroupID: "group-fail", UserID: "u", Text: "x"})
+	event := contract.Event{ID: "evt-write-fail", Topic: GroupTopic, Payload: payload}
+	if err := conn.Deliver(context.Background(), event); err == nil {
+		t.Fatal("连接关闭后 Deliver 应返回错误")
+	}
+	conn.pendingMu.Lock()
+	_, ok := conn.pending["evt-write-fail"]
+	conn.pendingMu.Unlock()
+	if ok {
+		t.Fatal("写入失败的事件不应保留在 pending")
+	}
+}
+
+// TestMaxMessageSizeDefault 验证未配置时应用端连接采用默认读上限。
+func TestMaxMessageSizeDefault(t *testing.T) {
+	adapter, err := New(testConfig(), endpoint.New(), &submitter{replies: make(chan contract.CandidateReply, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adapter.config.MaxMessageSize != defaultMaxMessageSize {
+		t.Fatalf("MaxMessageSize = %d，期望默认值 %d", adapter.config.MaxMessageSize, defaultMaxMessageSize)
+	}
+}
+
+// TestRejectsOversizedApplicationFrame 验证超过读上限的应用端帧会导致连接关闭，
+// 防止超大帧持续扩容撑爆内存。
+func TestRejectsOversizedApplicationFrame(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxMessageSize = 1024
+	adapter, err := New(cfg, endpoint.New(), &submitter{replies: make(chan contract.CandidateReply, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Shutdown(context.Background())
+	u, _ := url.Parse("ws://" + adapter.Addr() + "/v11")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	socket, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	waitConnection(t, adapter)
+	frame := []byte(`{"__botfabric_endpoint_id":"oversized","pad":"` + strings.Repeat("x", 4096) + `"}`)
+	if err := socket.WriteMessage(websocket.TextMessage, frame); err != nil {
+		t.Fatalf("写入超大帧失败: %v", err)
+	}
+	_ = socket.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		_, _, err := socket.ReadMessage()
+		if err == nil {
+			continue
+		}
+		if !websocket.IsCloseError(err, websocket.CloseMessageTooBig) && !strings.Contains(err.Error(), "read limit") {
+			t.Fatalf("超大帧应触发 1009/read limit，实际错误: %v", err)
+		}
+		return
+	}
+}
+
+// TestAcceptsFrameAtMaxMessageSize 验证恰好等于读上限的帧仍可正常处理（上限为严格大于才拒绝）。
+func TestAcceptsFrameAtMaxMessageSize(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxMessageSize = 512
+	adapter, err := New(cfg, endpoint.New(), &submitter{replies: make(chan contract.CandidateReply, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Shutdown(context.Background())
+	u, _ := url.Parse("ws://" + adapter.Addr() + "/v11")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	socket, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	waitConnection(t, adapter)
+	base := `{"__botfabric_endpoint_id":"app:exact-limit","pad":""}`
+	padding := int(cfg.MaxMessageSize) - len(base)
+	if padding < 0 {
+		t.Fatalf("测试帧基础长度 %d 超过上限 %d", len(base), cfg.MaxMessageSize)
+	}
+	frame := []byte(`{"__botfabric_endpoint_id":"app:exact-limit","pad":"` + strings.Repeat("x", padding) + `"}`)
+	if int64(len(frame)) != cfg.MaxMessageSize {
+		t.Fatalf("测试帧长度 = %d，期望 %d", len(frame), cfg.MaxMessageSize)
+	}
+	if err := socket.WriteMessage(websocket.TextMessage, frame); err != nil {
+		t.Fatalf("写入上限大小帧失败: %v", err)
+	}
+	readReply(t, socket, "ok")
+	waitForConnID(t, adapter, "app:exact-limit")
+}
+
+// TestDeliverConcurrentWithIdentitySwitch 验证交替声明稳定身份与并发投递之间不存在数据竞争。
+// 该回归需配合 go test -race 运行。
+func TestDeliverConcurrentWithIdentitySwitch(t *testing.T) {
+	adapter, err := New(testConfig(), endpoint.New(), &submitter{replies: make(chan contract.CandidateReply, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Shutdown(context.Background())
+	u, _ := url.Parse("ws://" + adapter.Addr() + "/v11")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	socket, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	// 持续消费推送信封与身份确认，避免服务端写阻塞。
+	go func() {
+		for {
+			if _, _, err := socket.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+	waitConnection(t, adapter)
+
+	const rounds = 200
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		payload, _ := json.Marshal(contract.GroupMessage{MessageID: "m-race", GroupID: "group-race", UserID: "u", Text: "x"})
+		for i := 0; i < rounds; i++ {
+			event := contract.Event{ID: fmt.Sprintf("race-evt-%d", i), Topic: GroupTopic, Payload: payload}
+			_ = adapter.Deliver(context.Background(), event, nil)
+		}
+	}()
+	for i := 0; i < rounds; i++ {
+		id := "app:race-stable-a"
+		if i%2 == 1 {
+			id = "app:race-stable-b"
+		}
+		if err := socket.WriteJSON(map[string]any{"__botfabric_endpoint_id": id}); err != nil {
+			t.Fatalf("声明身份帧写入失败: %v", err)
+		}
+	}
+	wg.Wait()
+}
+
+// TestRejectsStableIdentityOutsideNamespace 验证客户端不能声明插件 ID 等受信主体。
+func TestRejectsStableIdentityOutsideNamespace(t *testing.T) {
+	adapter, err := New(testConfig(), endpoint.New(), &submitter{replies: make(chan contract.CandidateReply, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Shutdown(context.Background())
+	u, _ := url.Parse("ws://" + adapter.Addr() + "/v11")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	socket, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	connection := waitConnection(t, adapter)
+	dynamicID := connection.endpointID()
+	if err := socket.WriteJSON(map[string]any{"__botfabric_endpoint_id": "example.reply"}); err != nil {
+		t.Fatal(err)
+	}
+	// 读取身份确认帧，确保该帧已被处理。
+	_ = socket.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := socket.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := adapter.endpoints.Get("example.reply"); exists {
+		t.Fatal("未命名空间化的身份不应注册为端点")
+	}
+	if got := connection.endpointID(); got != dynamicID {
+		t.Fatalf("连接 ID 被意外改为 %q", got)
+	}
+}
+
+// TestRejectsStableIdentityOwnedByOtherOwner 验证其他 owner 的端点 ID 不可被冒用或覆盖。
+func TestRejectsStableIdentityOwnedByOtherOwner(t *testing.T) {
+	endpoints := endpoint.New()
+	if err := endpoints.Register(contract.EndpointInfo{ID: "app:conflict", Owner: "plugin.other", Kind: contract.EndpointProtocol}); err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := New(testConfig(), endpoints, &submitter{replies: make(chan contract.CandidateReply, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Shutdown(context.Background())
+	u, _ := url.Parse("ws://" + adapter.Addr() + "/v11")
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	socket, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	connection := waitConnection(t, adapter)
+	dynamicID := connection.endpointID()
+	if err := socket.WriteJSON(map[string]any{"__botfabric_endpoint_id": "app:conflict"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = socket.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := socket.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	info, exists := endpoints.Get("app:conflict")
+	if !exists || info.Owner != "plugin.other" {
+		t.Fatalf("其他 owner 的端点被覆盖: %#v, exists=%v", info, exists)
+	}
+	if got := connection.endpointID(); got != dynamicID {
+		t.Fatalf("连接 ID 被意外改为 %q", got)
 	}
 }
