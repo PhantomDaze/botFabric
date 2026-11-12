@@ -43,16 +43,18 @@ BotFabric 是位于 QQ 协议端与应用端之间的**完全插件化机器人�
 - 可选多协议真实 LLM 分类器：支持 OpenAI Chat Completions、Anthropic Messages、OpenAI Responses 和 Google Gemini `generateContent`，显式加载后使用环境变量密钥，失败时回退为候选广播；
 - 响应协调器：CandidateReply、first-wins、priority-override、幂等和指定机器人回复；
 - 四个路由预设：broadcast、regex、competition、required-bot；
-- 应用端 OneBot v11/v12：服务端等待应用连接、主动连接远端应用、事件推送和候选回复回收；
+- 应用端 OneBot v11/v12：服务端等待应用连接、主动连接远端应用、事件推送和候选回复回收；支持 `app:` 命名空间下的稳定身份、未回复事件 TTL/容量上限与单条消息读上限 `max_message_size`；
 - Bearer Token 管理与诊断 API；
-- 外部进程插件的 Unix Socket 双向 gRPC Session、短期会话令牌、事件/服务双向通信和进程组回收；Linux 可通过 systemd transient service 使用 cgroup v2 限制整棵进程树内存，并可按 Manifest 显式启用 PrivateNetwork 网络命名空间隔离、NoNewPrivileges 提权防护、PrivateTmp 临时目录隔离、固定 syscall 拒绝组、地址族限制和 capability bounding set 限制；隔离请求均在宿主不支持时拒绝启动；
+- 可选 Prometheus 指标端点：显式配置 `observability.metrics_enabled` 与 `metrics_listen_address` 后，Runtime 在独立只读 `/metrics` 输出事件发布/拒绝/去重/路由丢弃、投递成功/失败/死信、投递计划模式、分类器回退、候选回复采纳/丢弃与插件启动失败计数；
+- 外部进程插件的 Unix Socket 双向 gRPC Session、短期会话令牌（仅约束启动握手）、事件/服务双向通信和进程组回收；插件进程只继承最小环境白名单，Socket 以 `SO_PEERCRED` 绑定启动进程，异常退出由 Runtime 回滚服务/订阅/端点并迁移为 failed；Linux 可通过 systemd transient service 使用 cgroup v2 限制整棵进程树内存，并可按 Manifest 显式启用 PrivateNetwork 网络命名空间隔离、NoNewPrivileges 提权防护、PrivateTmp 临时目录隔离、ProtectHome 家目录隐藏、ProtectSystem 系统目录只读、固定 syscall 拒绝组、地址族限制和 capability bounding set 限制；隔离请求均在宿主不支持时拒绝启动；
 - Go、Python 与 TypeScript 外部进程插件 SDK；
 
 暂未完成或仅提供骨架：
 
 - 真实 LLM 分类器现支持 OpenAI Chat Completions、Anthropic Messages、OpenAI Responses 和 Google Gemini `generateContent` 四种 API 格式，默认仍为 OpenAI Chat Completions；兼容性以具体格式及服务端 JSON 输出能力为准，尚不代表所有供应商/模型组合均验证通过。新增离线路由质量评估工具，仍需针对目标数据集和具体模型运行评估；
-- 高级沙箱仍有待完善；外部进程插件现支持 Linux opt-in 的 `private_network`、`no_new_privileges`、`private_tmp`、固定 syscall 拒绝组、`restrict_address_families`（限定为 `AF_UNIX`）和 `capability_bounding_set`，但 user systemd manager 只有在 user namespace 等宿主能力可用时才能应用 capability 限制；尚无细粒度 egress allowlist（`restrict_address_families` 是粗粒度地址族限制，不能按域名/IP 放行）或其他平台的等价隔离；`Router.Plan` 已提供默认广播和规则匹配的 Go 性能基准，用于本机比较，不构成跨环境性能承诺。
+- 高级沙箱仍有待完善；外部进程插件现支持 Linux opt-in 的 `private_network`、`no_new_privileges`、`private_tmp`、`protect_home`、`protect_system`、固定 syscall 拒绝组、`restrict_address_families`（限定为 `AF_UNIX`）和 `capability_bounding_set`，但 user systemd manager 只有在 user namespace 等宿主能力可用时才能应用 capability 限制；`protect_home` 完全隐藏 `/home`、`/root` 与 `/run/user`（Socket 目录不能位于其中），`protect_system` 只把 `/usr`、`/boot`、`/etc` 置为只读，二者都不是按路径白名单的文件系统沙箱；尚无细粒度 egress allowlist（`restrict_address_families` 是粗粒度地址族限制，不能按域名/IP 放行）、可写路径白名单或其他平台的等价隔离；`Router.Plan` 已提供默认广播和规则匹配的 Go 性能基准，用于本机比较，不构成跨环境性能承诺。
 - 内存去重器 `Deduplicator.Check` 已提供消息 ID 与文本指纹新事件路径基准（`go test ./internal/dedup -run '^$' -bench '^BenchmarkDeduplicatorCheck' -benchmem`），仅作本机性能对比。
+- 指标为进程内累计值，重启归零，多实例部署需在抓取侧聚合；`/metrics` 无内置认证，建议仅绑定回环或内网地址；`tracing_enabled` 仍为保留配置，TraceID 已贯穿事件与日志，但尚未导出外部追踪数据。
 
 ## 真实 LLM 分类器
 
