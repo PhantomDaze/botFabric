@@ -22,28 +22,84 @@ type Store interface {
 	Claim(key string, ttl time.Duration, now time.Time) bool
 }
 
+const (
+	// defaultMaxEntries 是内存去重存储的默认条目上限，防止唯一键无界累积。
+	defaultMaxEntries = 65536
+	// sweepInterval 是惰性清理的最小间隔，避免每次 Claim 都全量遍历。
+	sweepInterval = time.Second
+)
+
 // MemoryStore 是带过期时间的线程安全内存去重存储。
 type MemoryStore struct {
-	mu      sync.Mutex
-	entries map[string]time.Time
+	mu         sync.Mutex
+	entries    map[string]time.Time
+	maxEntries int       // 条目上限；<=0 表示不限
+	lastSweep  time.Time // 上次惰性清理时间
 }
 
 // NewMemoryStore 创建空内存存储。
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{entries: make(map[string]time.Time)}
+	return NewMemoryStoreWithLimit(defaultMaxEntries)
+}
+
+// NewMemoryStoreWithLimit 创建带条目上限的内存存储；maxEntries<=0 表示不限。
+func NewMemoryStoreWithLimit(maxEntries int) *MemoryStore {
+	return &MemoryStore{entries: make(map[string]time.Time), maxEntries: maxEntries}
 }
 
 // Claim 尝试占用一个具有 TTL 的键。
+// 为避免过期条目无界累积，Claim 会按时间节流惰性清理过期键，
+// 并在条目数达到上限时淘汰最早过期的条目（可能牺牲一次去重判定，换取有界内存）。
 func (s *MemoryStore) Claim(key string, ttl time.Duration, now time.Time) bool {
 	if key == "" || ttl <= 0 {
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.sweepLocked(now)
 	if expiresAt, exists := s.entries[key]; exists && expiresAt.After(now) {
 		return false
 	}
+	for s.maxEntries > 0 && len(s.entries) >= s.maxEntries {
+		if !s.evictEarliestLocked() {
+			break
+		}
+	}
 	s.entries[key] = now.Add(ttl)
+	return true
+}
+
+// sweepLocked 按 sweepInterval 节流删除过期条目。调用方须持有 s.mu。
+func (s *MemoryStore) sweepLocked(now time.Time) {
+	if !s.lastSweep.IsZero() && now.Sub(s.lastSweep) < sweepInterval {
+		return
+	}
+	s.lastSweep = now
+	for key, expiresAt := range s.entries {
+		if !expiresAt.After(now) {
+			delete(s.entries, key)
+		}
+	}
+}
+
+// evictEarliestLocked 删除最早过期的条目；存储为空时返回 false。调用方须持有 s.mu。
+func (s *MemoryStore) evictEarliestLocked() bool {
+	var (
+		oldestKey string
+		oldestAt  time.Time
+		found     bool
+	)
+	for key, expiresAt := range s.entries {
+		if !found || expiresAt.Before(oldestAt) {
+			oldestKey = key
+			oldestAt = expiresAt
+			found = true
+		}
+	}
+	if !found {
+		return false
+	}
+	delete(s.entries, oldestKey)
 	return true
 }
 
