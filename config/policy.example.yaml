@@ -16,6 +16,16 @@ plugins:
     provide:
       - protocol.qq.action
 
+  # 应用端适配器使用固定的内部动作调用主体，不采用客户端声明的端点 ID。
+  application.onebot:
+    publish: []
+    subscribe: []
+    invoke:
+      - service: protocol.qq.action
+        methods:
+          - SendMessage
+    provide: []
+
   example.reply:
     publish: []
     subscribe:

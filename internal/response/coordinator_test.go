@@ -144,3 +144,88 @@ func TestCoordinatorAsyncInvokerIsSafeForTest(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestHandleServiceRequestUsesCallerIdentity 验证服务入口忽略载荷中的 application_id，
+// 始终以网关签发的调用方身份执行动作，防止插件伪造他人身份越权。
+func TestHandleServiceRequestUsesCallerIdentity(t *testing.T) {
+	coordinator, calls := newTestCoordinator(t)
+	policy := contract.ResponsePolicy{Mode: contract.ResponseFirstWins}
+	coordinator.RegisterEvent(testEvent(policy), policy)
+	payload := mustJSON(map[string]any{
+		"event_id":         "event-1",
+		"application_id":   "app-b", // 伪造身份，应被忽略
+		"dispatch_subject": "application.onebot",
+		"group_id":         "1",
+		"text":             "spoof",
+	})
+	response, err := coordinator.HandleServiceRequest(context.Background(), contract.Request{
+		Caller:  "app-a",
+		Method:  SubmitMethod,
+		Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result SubmitResult
+	if err := json.Unmarshal(response.Payload, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "accepted" {
+		t.Fatalf("提交结果 = %#v", result)
+	}
+	caller, request := calls.snapshot()
+	if caller != "app-a" {
+		t.Fatalf("动作调用方 = %q，期望 app-a（不能采用载荷中的 app-b）", caller)
+	}
+	var action contract.SendMessageRequest
+	if err := json.Unmarshal(request.Payload, &action); err != nil {
+		t.Fatal(err)
+	}
+	if action.Text != "spoof" {
+		t.Fatalf("动作载荷错误: %#v", action)
+	}
+}
+
+// TestHandleServiceRequestRejectsEmptyCaller 验证无调用方身份的服务请求被拒绝，
+// 避免载荷自行声明身份成为唯一来源。
+func TestHandleServiceRequestRejectsEmptyCaller(t *testing.T) {
+	coordinator, calls := newTestCoordinator(t)
+	policy := contract.ResponsePolicy{Mode: contract.ResponseFirstWins}
+	coordinator.RegisterEvent(testEvent(policy), policy)
+	payload := mustJSON(map[string]any{
+		"event_id":       "event-1",
+		"application_id": "app-b",
+		"group_id":       "1",
+		"text":           "spoof",
+	})
+	if _, err := coordinator.HandleServiceRequest(context.Background(), contract.Request{
+		Method:  SubmitMethod,
+		Payload: payload,
+	}); err == nil {
+		t.Fatal("空调用方应被拒绝")
+	}
+	caller, _ := calls.snapshot()
+	if caller != "" {
+		t.Fatalf("非法请求不应触发动作调用，caller=%q", caller)
+	}
+}
+
+// TestDispatchSubjectOverridesApplicationID 验证服务端内部调用主体优先于客户端可控的应用端 ID。
+func TestDispatchSubjectOverridesApplicationID(t *testing.T) {
+	coordinator, calls := newTestCoordinator(t)
+	policy := contract.ResponsePolicy{Mode: contract.ResponseNone}
+	coordinator.RegisterEvent(testEvent(policy), policy)
+	if _, err := coordinator.Submit(context.Background(), contract.CandidateReply{
+		EventID:         "event-1",
+		ApplicationID:   "v11-123456",
+		DispatchSubject: ApplicationDispatchSubject,
+		GroupID:         "1",
+		Text:            "reply",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	caller, _ := calls.snapshot()
+	if caller != ApplicationDispatchSubject {
+		t.Fatalf("动作调用方 = %q，期望固定主体 %q", caller, ApplicationDispatchSubject)
+	}
+}

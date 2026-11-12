@@ -232,3 +232,260 @@ func TestUnloadRemovesStoppedPlugin(t *testing.T) {
 func reloadManifest() contract.Manifest {
 	return contract.Manifest{ID: "reload.plugin", Name: "Reload Plugin", Version: "0.1.0", Runtime: contract.RuntimeInProcess, Entry: "reload.entry", Provides: contract.Provides{Services: []contract.ServiceDescriptor{{Name: "reload.service", Methods: []string{"Run"}}}}, Limits: contract.Limits{Timeout: time.Second}}
 }
+
+// reloadEndpointPlugin 在 Start 注册固定端点，并在 Stop 中主动注销，
+// 用于验证重载切换后旧实例的清理不会删除新实例接管的同名端点。
+type reloadEndpointPlugin struct {
+	manifest  contract.Manifest
+	endpoint  string
+	registrar contract.EndpointRegistrar
+	started   atomic.Bool
+}
+
+func (p *reloadEndpointPlugin) Manifest() contract.Manifest { return p.manifest }
+func (p *reloadEndpointPlugin) Start(_ context.Context, host contract.Host) error {
+	registrar, ok := host.(contract.EndpointRegistrar)
+	if !ok {
+		return errors.New("宿主不支持端点注册")
+	}
+	p.registrar = registrar
+	if err := registrar.RegisterEndpoint(contract.EndpointInfo{ID: p.endpoint, Kind: contract.EndpointApplication, Protocol: "botfabric"}); err != nil {
+		return err
+	}
+	p.started.Store(true)
+	return nil
+}
+func (p *reloadEndpointPlugin) Stop(context.Context) error {
+	p.started.Store(false)
+	if p.registrar != nil {
+		return p.registrar.UnregisterEndpoint(p.endpoint)
+	}
+	return nil
+}
+func (*reloadEndpointPlugin) Health(context.Context) contract.HealthStatus {
+	return contract.HealthStatus{State: contract.HealthHealthy}
+}
+
+// fixedPlanClassifier 按预设计划返回路由结果，便于断言重载后分类器是否生效。
+type fixedPlanClassifier struct {
+	targets []string
+}
+
+func (c *fixedPlanClassifier) Classify(context.Context, contract.Event, []string) (contract.DispatchPlan, error) {
+	return contract.DispatchPlan{Mode: contract.DispatchSelective, Targets: append([]string(nil), c.targets...)}, nil
+}
+
+// reloadClassifierPlugin 在 Start 注册分类器，清单路由规则引用该分类器。
+type reloadClassifierPlugin struct {
+	manifest contract.Manifest
+	targets  []string
+	started  atomic.Bool
+}
+
+func (p *reloadClassifierPlugin) Manifest() contract.Manifest { return p.manifest }
+func (p *reloadClassifierPlugin) Start(_ context.Context, host contract.Host) error {
+	registrar, ok := host.(contract.RouteClassifierRegistrar)
+	if !ok {
+		return errors.New("宿主不支持分类器注册")
+	}
+	if err := registrar.RegisterRouteClassifier("reload.classifier", &fixedPlanClassifier{targets: p.targets}); err != nil {
+		return err
+	}
+	p.started.Store(true)
+	return nil
+}
+func (p *reloadClassifierPlugin) Stop(context.Context) error { p.started.Store(false); return nil }
+func (*reloadClassifierPlugin) Health(context.Context) contract.HealthStatus {
+	return contract.HealthStatus{State: contract.HealthHealthy}
+}
+
+func classifierReloadManifest() contract.Manifest {
+	return contract.Manifest{
+		ID:      "reload.classifier.plugin",
+		Name:    "Reload Classifier Plugin",
+		Version: "0.1.0",
+		Runtime: contract.RuntimeInProcess,
+		Entry:   "reload.classifier.entry",
+		Routing: &contract.RoutingSpec{Rules: []contract.RoutingRule{{
+			ID:       "reload-rule",
+			Priority: 10,
+			Match:    contract.RuleMatch{Topic: "bot.message.group"},
+			Action:   contract.RuleAction{Mode: contract.DispatchBroadcast, Classifier: "reload.classifier"},
+		}}},
+		Limits: contract.Limits{Timeout: time.Second},
+	}
+}
+
+// TestReloadEndpointPluginReusesStableID 回归：存在固定端点 ID 的插件可重载，
+// 新实例不再因 ErrEndpointExists 失败，且旧实例 Stop 不会删除新端点。
+func TestReloadEndpointPluginReusesStableID(t *testing.T) {
+	manager, _ := newTestManager(t)
+	manifest := testManifest("reload.endpoint.plugin", "reload.endpoint.entry")
+	const endpointID = "protocol.mockonebot.default"
+	old := &reloadEndpointPlugin{manifest: manifest, endpoint: endpointID}
+	loader := NewBuiltinLoader()
+	if err := loader.RegisterFactory(manifest.Entry, func() contract.Plugin { return old }); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RegisterLoader(loader); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Load(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background(), manifest.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	newPlugin := &reloadEndpointPlugin{manifest: manifest, endpoint: endpointID}
+	loader2 := NewBuiltinLoader()
+	if err := loader2.RegisterFactory(manifest.Entry, func() contract.Plugin { return newPlugin }); err != nil {
+		t.Fatal(err)
+	}
+	manager.loaders[contract.RuntimeInProcess] = loader2
+	if err := manager.Reload(context.Background(), manifest); err != nil {
+		t.Fatalf("带固定端点的插件应可重载: %v", err)
+	}
+	if !newPlugin.started.Load() {
+		t.Fatal("重载后新实例应运行")
+	}
+	info, exists := manager.Endpoints().Get(endpointID)
+	if !exists {
+		t.Fatal("重载后端点应存在")
+	}
+	if info.Owner != manifest.ID {
+		t.Fatalf("端点 owner = %q，期望 %q", info.Owner, manifest.ID)
+	}
+}
+
+// TestReloadClassifierPluginTakesEffect 回归：分类器插件重载成功，新分类器立即生效。
+func TestReloadClassifierPluginTakesEffect(t *testing.T) {
+	manager, _ := newTestManager(t)
+	manifest := classifierReloadManifest()
+	old := &reloadClassifierPlugin{manifest: manifest, targets: []string{"old-target"}}
+	loader := NewBuiltinLoader()
+	if err := loader.RegisterFactory(manifest.Entry, func() contract.Plugin { return old }); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RegisterLoader(loader); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Load(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background(), manifest.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	newPlugin := &reloadClassifierPlugin{manifest: manifest, targets: []string{"new-target"}}
+	loader2 := NewBuiltinLoader()
+	if err := loader2.RegisterFactory(manifest.Entry, func() contract.Plugin { return newPlugin }); err != nil {
+		t.Fatal(err)
+	}
+	manager.loaders[contract.RuntimeInProcess] = loader2
+	if err := manager.Reload(context.Background(), manifest); err != nil {
+		t.Fatalf("分类器插件应可重载: %v", err)
+	}
+	if !newPlugin.started.Load() {
+		t.Fatal("重载后新实例应运行")
+	}
+	plan := manager.Router().Plan(context.Background(), contract.Event{Topic: "bot.message.group"}, []string{"candidate"})
+	if len(plan.Targets) != 1 || plan.Targets[0] != "new-target" {
+		t.Fatalf("重载后分类器计划 = %#v，期望 new-target", plan)
+	}
+}
+
+// TestReloadFailureKeepsPreviousRouting 回归：新实例启动失败时不得替换线上路由规则。
+func TestReloadFailureKeepsPreviousRouting(t *testing.T) {
+	manager, _ := newTestManager(t)
+	manifest := reloadManifest()
+	manifest.Routing = &contract.RoutingSpec{Rules: []contract.RoutingRule{{
+		ID:       "old-rule",
+		Priority: 10,
+		Match:    contract.RuleMatch{Topic: "bot.message.group"},
+		Action:   contract.RuleAction{Mode: contract.DispatchSelective, Targets: []string{"app.alpha"}},
+	}}}
+	old := &reloadPlugin{manifest: manifest, version: "old"}
+	loader := NewBuiltinLoader()
+	if err := loader.RegisterFactory(manifest.Entry, func() contract.Plugin { return old }); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RegisterLoader(loader); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Load(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background(), manifest.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	newManifest := manifest
+	newManifest.Routing = &contract.RoutingSpec{Rules: []contract.RoutingRule{{
+		ID:       "new-rule",
+		Priority: 10,
+		Match:    contract.RuleMatch{Topic: "bot.message.group"},
+		Action:   contract.RuleAction{Mode: contract.DispatchSelective, Targets: []string{"app.beta"}},
+	}}}
+	newPlugin := &reloadPlugin{manifest: newManifest, version: "new", fail: true}
+	loader2 := NewBuiltinLoader()
+	if err := loader2.RegisterFactory(manifest.Entry, func() contract.Plugin { return newPlugin }); err != nil {
+		t.Fatal(err)
+	}
+	manager.loaders[contract.RuntimeInProcess] = loader2
+	if err := manager.Reload(context.Background(), newManifest); err == nil {
+		t.Fatal("失败重载应返回错误")
+	}
+	if !old.started.Load() {
+		t.Fatal("重载失败后旧插件应保持运行")
+	}
+	plan := manager.Router().Plan(context.Background(), contract.Event{Topic: "bot.message.group"}, []string{"candidate"})
+	if len(plan.Targets) != 1 || plan.Targets[0] != "app.alpha" {
+		t.Fatalf("失败重载后路由计划 = %#v，期望仍为 app.alpha", plan)
+	}
+}
+
+// blockingStopPlugin 的 Stop 只在上下文截止后返回，用于验证重载失败清理有超时保护。
+type blockingStopPlugin struct {
+	reloadPlugin
+}
+
+func (p *blockingStopPlugin) Stop(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestReloadFailureCleanupHonorsTimeout 回归：暂存实例 Stop 卡住时 Reload 不应永久阻塞。
+func TestReloadFailureCleanupHonorsTimeout(t *testing.T) {
+	manager, _ := newTestManager(t)
+	manager.shutdownTimeout = 50 * time.Millisecond
+	manifest := reloadManifest()
+	old := &reloadPlugin{manifest: manifest, version: "old"}
+	loader := NewBuiltinLoader()
+	if err := loader.RegisterFactory(manifest.Entry, func() contract.Plugin { return old }); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RegisterLoader(loader); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Load(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background(), manifest.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	staged := &blockingStopPlugin{reloadPlugin: reloadPlugin{manifest: manifest, fail: true}}
+	loader2 := NewBuiltinLoader()
+	if err := loader2.RegisterFactory(manifest.Entry, func() contract.Plugin { return staged }); err != nil {
+		t.Fatal(err)
+	}
+	manager.loaders[contract.RuntimeInProcess] = loader2
+	started := time.Now()
+	if err := manager.Reload(context.Background(), manifest); err == nil {
+		t.Fatal("失败重载应返回错误")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("重载清理耗时 %v，应受 shutdownTimeout 限制", elapsed)
+	}
+}

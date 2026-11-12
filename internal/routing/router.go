@@ -8,8 +8,10 @@ import (
 	"regexp"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/PhantomDaze/botfabric/internal/observability"
 	"github.com/PhantomDaze/botfabric/pkg/contract"
 )
 
@@ -29,6 +31,7 @@ type Router struct {
 	classifierOwners  map[string]string
 	defaultPlan       contract.DispatchPlan
 	classifierTimeout time.Duration
+	metrics           atomic.Pointer[observability.Metrics]
 }
 
 type compiledRule struct {
@@ -46,6 +49,11 @@ func New() *Router {
 		defaultPlan:       contract.DispatchPlan{Mode: contract.DispatchBroadcast},
 		classifierTimeout: time.Second,
 	}
+}
+
+// SetMetrics 注入可选的运行时指标注册表。
+func (r *Router) SetMetrics(metrics *observability.Metrics) {
+	r.metrics.Store(metrics)
 }
 
 // SetClassifierTimeout 设置分类器调用的独立超时时间。
@@ -67,6 +75,26 @@ func (r *Router) RegisterClassifier(id string, classifier RouteClassifier) error
 // RegisterClassifierForOwner 注册并绑定分类器所有者。
 func (r *Router) RegisterClassifierForOwner(owner, id string, classifier RouteClassifier) error {
 	return r.registerClassifier(owner, id, classifier)
+}
+
+// ClassifierSpec 描述一个已注册分类器，用于热重载时快照与恢复。
+type ClassifierSpec struct {
+	ID         string
+	Classifier RouteClassifier
+}
+
+// SnapshotClassifiers 返回指定 owner 已注册分类器的快照。
+func (r *Router) SnapshotClassifiers(owner string) []ClassifierSpec {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	result := make([]ClassifierSpec, 0)
+	for id, registeredOwner := range r.classifierOwners {
+		if registeredOwner == owner {
+			result = append(result, ClassifierSpec{ID: id, Classifier: r.classifiers[id]})
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	return result
 }
 
 func (r *Router) registerClassifier(owner, id string, classifier RouteClassifier) error {
@@ -120,17 +148,40 @@ func (r *Router) RegisterRules(owner string, spec *contract.RoutingSpec) error {
 		r.UnregisterRules(owner)
 		return nil
 	}
+	compiled, err := compileRules(owner, spec)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.rules[owner] = compiled
+	r.mu.Unlock()
+	return nil
+}
+
+// ValidateRules 只编译规则而不写入路由器，供热重载在切换前做预校验。
+func (r *Router) ValidateRules(owner string, spec *contract.RoutingSpec) error {
+	if owner == "" {
+		return errors.New("路由规则 owner 不能为空")
+	}
+	if spec == nil {
+		return nil
+	}
+	_, err := compileRules(owner, spec)
+	return err
+}
+
+func compileRules(owner string, spec *contract.RoutingSpec) ([]compiledRule, error) {
 	compiled := make([]compiledRule, 0, len(spec.Rules))
 	for _, rule := range spec.Rules {
 		if rule.ID == "" {
-			return errors.New("路由规则 ID 不能为空")
+			return nil, errors.New("路由规则 ID 不能为空")
 		}
 		var expression *regexp.Regexp
 		var err error
 		if rule.Match.TextRegex != "" {
 			expression, err = regexp.Compile(rule.Match.TextRegex)
 			if err != nil {
-				return err
+				return nil, err
 			}
 		}
 		compiled = append(compiled, compiledRule{owner: owner, rule: cloneRule(rule), regex: expression})
@@ -138,10 +189,7 @@ func (r *Router) RegisterRules(owner string, spec *contract.RoutingSpec) error {
 	sort.SliceStable(compiled, func(i, j int) bool {
 		return compiled[i].rule.Priority > compiled[j].rule.Priority
 	})
-	r.mu.Lock()
-	r.rules[owner] = compiled
-	r.mu.Unlock()
-	return nil
+	return compiled, nil
 }
 
 // UnregisterRules 移除指定 owner 的规则。
@@ -153,7 +201,8 @@ func (r *Router) UnregisterRules(owner string) {
 
 // Plan 根据事件和候选应用端生成投递计划。
 // 无匹配规则时返回默认广播计划；规则的 Targets 为空时保持候选集不变。
-func (r *Router) Plan(ctx context.Context, event contract.Event, candidates []string) contract.DispatchPlan {
+func (r *Router) Plan(ctx context.Context, event contract.Event, candidates []string) (plan contract.DispatchPlan) {
+	defer func() { r.recordPlan(plan) }()
 	r.mu.RLock()
 	rules := make([]compiledRule, 0)
 	for _, ownerRules := range r.rules {
@@ -191,6 +240,29 @@ func (r *Router) Plan(ctx context.Context, event contract.Event, candidates []st
 	return defaultPlan
 }
 
+// recordPlan 按最终投递计划累计指标。
+func (r *Router) recordPlan(plan contract.DispatchPlan) {
+	metrics := r.metrics.Load()
+	if metrics == nil {
+		return
+	}
+	switch {
+	case plan.Drop:
+		metrics.PlanDropped()
+	case plan.Mode == contract.DispatchSelective:
+		metrics.PlanSelective()
+	default:
+		metrics.PlanBroadcast()
+	}
+}
+
+// recordClassifierFallback 记录一次分类器不可用导致的回退。
+func (r *Router) recordClassifierFallback() {
+	if metrics := r.metrics.Load(); metrics != nil {
+		metrics.ClassifierFallback()
+	}
+}
+
 func (r *Router) planForRule(ctx context.Context, action contract.RuleAction, event contract.Event, candidates []string, classifiers map[string]RouteClassifier, timeout time.Duration, fallback contract.DispatchPlan) contract.DispatchPlan {
 	plan := contract.DispatchPlan{Mode: action.Mode, Policy: clonePolicy(action.Response)}
 	if plan.Mode == "" {
@@ -207,12 +279,14 @@ func (r *Router) planForRule(ctx context.Context, action contract.RuleAction, ev
 	if action.Classifier != "" {
 		classifier := classifiers[action.Classifier]
 		if classifier == nil {
+			r.recordClassifierFallback()
 			return fallbackWithTargets(fallback, candidates)
 		}
 		classifyCtx, cancel := context.WithTimeout(ctx, timeout)
 		classified, err := classifier.Classify(classifyCtx, event, append([]string(nil), candidates...))
 		cancel()
 		if err != nil {
+			r.recordClassifierFallback()
 			return fallbackWithTargets(fallback, candidates)
 		}
 		if classified.Mode == "" {

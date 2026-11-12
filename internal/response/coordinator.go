@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/PhantomDaze/botfabric/internal/endpoint"
+	"github.com/PhantomDaze/botfabric/internal/observability"
 	"github.com/PhantomDaze/botfabric/pkg/contract"
 )
 
@@ -21,6 +23,10 @@ const (
 	// CancelMethod 取消一个未决事件的候选回复。
 	CancelMethod = "Cancel"
 )
+
+// ApplicationDispatchSubject 是应用端适配器发起协议动作调用时使用的固定内部主体。
+// 该主体只由服务端写入，不从客户端载荷派生，便于策略中做稳定授权。
+const ApplicationDispatchSubject = "application.onebot"
 
 // ActionInvoker 以指定应用端身份调用协议动作服务。
 type ActionInvoker func(ctx context.Context, caller string, request contract.Request) (contract.Response, error)
@@ -96,6 +102,7 @@ type Coordinator struct {
 	pending   map[string][]contract.CandidateReply
 	timers    map[string]*time.Timer
 	expires   map[string]*time.Timer
+	metrics   atomic.Pointer[observability.Metrics]
 }
 
 // New 创建响应协调器。
@@ -124,6 +131,11 @@ func (c *Coordinator) SetStore(store CandidateStore) error {
 	c.store = store
 	c.mu.Unlock()
 	return nil
+}
+
+// SetMetrics 注入可选的运行时指标注册表。
+func (c *Coordinator) SetMetrics(metrics *observability.Metrics) {
+	c.metrics.Store(metrics)
 }
 
 // RegisterEvent 保存待回复事件及其响应策略。
@@ -168,11 +180,17 @@ func (c *Coordinator) Submit(ctx context.Context, reply contract.CandidateReply)
 	if reply.EventID == "" || reply.ApplicationID == "" || reply.GroupID == "" || reply.Text == "" {
 		return SubmitResult{}, &contract.ServiceError{Code: contract.ErrorInvalidArgument, Message: "候选回复缺少 event_id、application_id、group_id 或 text"}
 	}
+	if metrics := c.metrics.Load(); metrics != nil {
+		metrics.ResponseCandidate()
+	}
 	key := reply.IdempotencyKey
 	if key == "" {
 		key = reply.ApplicationID + "\x00" + reply.EventID
 	}
 	if !c.store.Claim(reply.EventID, key) {
+		if metrics := c.metrics.Load(); metrics != nil {
+			metrics.ResponseDiscarded()
+		}
 		return SubmitResult{Status: "discarded"}, nil
 	}
 
@@ -189,6 +207,9 @@ func (c *Coordinator) Submit(ctx context.Context, reply contract.CandidateReply)
 	}
 	if policy.Mode == contract.ResponseFirstWins {
 		if !c.store.TryWin(reply.EventID, key) {
+			if metrics := c.metrics.Load(); metrics != nil {
+				metrics.ResponseDiscarded()
+			}
 			return SubmitResult{Status: "discarded"}, nil
 		}
 		result, err := c.send(ctx, event, policy, reply, true)
@@ -237,6 +258,9 @@ func (c *Coordinator) flush(eventID string) {
 
 func (c *Coordinator) send(ctx context.Context, event contract.Event, policy contract.ResponsePolicy, reply contract.CandidateReply, alreadyWon bool) (SubmitResult, error) {
 	if !alreadyWon && c.store.Winner(event.ID) {
+		if metrics := c.metrics.Load(); metrics != nil {
+			metrics.ResponseDiscarded()
+		}
 		return SubmitResult{Status: "discarded"}, nil
 	}
 	botID := reply.TargetBotID
@@ -281,7 +305,12 @@ func (c *Coordinator) send(ctx context.Context, event contract.Event, policy con
 	if err != nil {
 		return SubmitResult{}, err
 	}
-	response, err := c.invoke(ctx, reply.ApplicationID, contract.Request{
+	// 优先使用服务端内部主体，避免以客户端可控的应用端 ID 作为策略主体。
+	subject := reply.DispatchSubject
+	if subject == "" {
+		subject = reply.ApplicationID
+	}
+	response, err := c.invoke(ctx, subject, contract.Request{
 		Service:       "protocol.qq.action",
 		Method:        "SendMessage",
 		TraceID:       event.TraceID,
@@ -299,6 +328,9 @@ func (c *Coordinator) send(ctx context.Context, event contract.Event, policy con
 		if err := json.Unmarshal(response.Payload, &result); err != nil {
 			return SubmitResult{}, fmt.Errorf("解析回复动作结果: %w", err)
 		}
+	}
+	if metrics := c.metrics.Load(); metrics != nil {
+		metrics.ResponseAccepted()
 	}
 	return SubmitResult{Status: "accepted", MessageID: result.MessageID, Winner: true}, nil
 }
@@ -322,9 +354,10 @@ func (c *Coordinator) HandleServiceRequest(ctx context.Context, request contract
 	if err := json.Unmarshal(request.Payload, &reply); err != nil {
 		return contract.Response{}, &contract.ServiceError{Code: contract.ErrorInvalidArgument, Message: "Submit 载荷无效"}
 	}
-	if reply.ApplicationID == "" {
-		reply.ApplicationID = request.Caller
-	}
+	// 服务入口一律以调用方身份执行，忽略载荷中的 application_id，
+	// 防止插件伪造他人身份越权调用动作服务。
+	reply.ApplicationID = request.Caller
+	reply.DispatchSubject = request.Caller
 	result, err := c.Submit(ctx, reply)
 	if err != nil {
 		return contract.Response{}, err

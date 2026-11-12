@@ -15,6 +15,7 @@ import (
 	"github.com/PhantomDaze/botfabric/internal/endpoint"
 	"github.com/PhantomDaze/botfabric/internal/eventbus"
 	"github.com/PhantomDaze/botfabric/internal/gateway"
+	"github.com/PhantomDaze/botfabric/internal/observability"
 	"github.com/PhantomDaze/botfabric/internal/registry"
 	"github.com/PhantomDaze/botfabric/internal/response"
 	"github.com/PhantomDaze/botfabric/internal/routing"
@@ -38,6 +39,7 @@ type Manager struct {
 	loaders         map[contract.PluginRuntime]contract.PluginLoader
 	plugins         map[string]*managedPlugin
 	started         []string
+	metrics         atomic.Pointer[observability.Metrics]
 }
 
 type managedPlugin struct {
@@ -128,6 +130,15 @@ func (m *Manager) ResponseCoordinator() *response.Coordinator {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.coordinator
+}
+
+// SetMetrics 注入运行时指标，并同步到事件总线、路由器与响应协调器。
+// 应在开始接收流量前调用；传 nil 可关闭指标采集。
+func (m *Manager) SetMetrics(metrics *observability.Metrics) {
+	m.metrics.Store(metrics)
+	m.eventBus.SetMetrics(metrics)
+	m.router.SetMetrics(metrics)
+	m.coordinator.SetMetrics(metrics)
 }
 
 // SetDedupStore 注入共享去重存储（通常为 Redis 实现）。
@@ -270,6 +281,9 @@ func (m *Manager) Start(ctx context.Context, pluginID string) error {
 		startErr = m.validateRegisteredServices(managed.manifest)
 	}
 	if startErr != nil {
+		if metrics := m.metrics.Load(); metrics != nil {
+			metrics.PluginStartFailure()
+		}
 		managed.host.revoke()
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), m.shutdownTimeout)
 		_ = m.deactivateOwner(cleanupCtx, pluginID)
@@ -290,6 +304,36 @@ func (m *Manager) Start(ctx context.Context, pluginID string) error {
 	m.mu.Unlock()
 	m.logger.Info("插件已启动", "plugin_id", pluginID, "version", managed.manifest.Version)
 	return nil
+}
+
+// NotifyPluginExit 处理外部插件进程异常退出：注销其服务、订阅与端点，
+// 并把手握状态迁移为 failed，避免 Runtime 继续把请求路由到已死进程。
+// 自动重启策略留给上层编排，这里只保证状态与资源一致。
+func (m *Manager) NotifyPluginExit(pluginID string, err error) {
+	m.mu.Lock()
+	managed, exists := m.plugins[pluginID]
+	m.mu.Unlock()
+	if !exists {
+		return
+	}
+	// lifecycle 锁与 Start/Stop 串行：Start 结束前插件状态尚未到 running，
+	// Stop 进行中则说明是主动停止，均忽略。
+	managed.lifecycle.Lock()
+	defer managed.lifecycle.Unlock()
+	entry, exists := m.registry.Plugin(pluginID)
+	if !exists || entry.State != contract.PluginRunning {
+		return
+	}
+	m.logger.Error("外部插件进程异常退出，回滚运行时资源", "plugin_id", pluginID, "error", err)
+	managed.host.revoke()
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), m.shutdownTimeout)
+	_ = m.deactivateOwner(cleanupCtx, pluginID)
+	cancel()
+	m.rollback(pluginID)
+	m.mu.Lock()
+	m.started = removeID(m.started, pluginID)
+	m.mu.Unlock()
+	_ = m.registry.SetPluginState(pluginID, contract.PluginFailed)
 }
 
 // Stop 在超时预算内停止一个插件并清理其注册。
@@ -427,31 +471,53 @@ func (m *Manager) Reload(ctx context.Context, manifest contract.Manifest) error 
 		return fmt.Errorf("未注册执行模型 %s 的加载器", manifest.Runtime)
 	}
 
-	stagingHost, captureBus, captureGateway := newStagingHost(manifest, nil, nil, m.logger.With("plugin_id", manifest.ID, "staging", true), m.botID)
-	stagingHost.endpoints = m.endpoints
-	if err := m.router.RegisterRules(manifest.ID, manifest.Routing); err != nil {
+	stagingHost, captureBus, captureGateway, captureEndpoints, captureClassifiers := newStagingHost(manifest, nil, nil, m.logger.With("plugin_id", manifest.ID, "staging", true), m.botID)
+	// 只做编译预校验，不提前替换线上规则：失败重载不得改变旧实例的生效路由。
+	if err := m.router.ValidateRules(manifest.ID, manifest.Routing); err != nil {
+		stagingHost.revoke()
 		return fmt.Errorf("准备重载插件 %s 的路由规则: %w", manifest.ID, err)
 	}
 	staged, err := loader.Load(manifest, stagingHost)
 	if err != nil {
+		stagingHost.revoke()
 		return fmt.Errorf("装载重载插件 %s: %w", manifest.ID, err)
 	}
 	startCtx, cancel := context.WithTimeout(ctx, manifest.Limits.Timeout)
 	startErr := runPluginStart(startCtx, staged, stagingHost)
 	cancel()
 	if startErr != nil {
-		_ = staged.Stop(context.Background())
+		m.cleanupStaging(staged, stagingHost)
 		return fmt.Errorf("启动重载插件 %s: %w", manifest.ID, startErr)
 	}
 	if err := validateStagingResources(manifest, captureGateway.Specs(), captureBus.Specs()); err != nil {
-		_ = staged.Stop(context.Background())
+		m.cleanupStaging(staged, stagingHost)
 		return err
 	}
-	if err := m.cutover(ctx, old, staged, manifest, stagingHost, captureBus.Specs(), captureGateway.Specs()); err != nil {
-		_ = staged.Stop(context.Background())
+	if err := validateStagingCapabilities(manifest, captureEndpoints.Specs(), captureClassifiers.Specs()); err != nil {
+		m.cleanupStaging(staged, stagingHost)
+		return err
+	}
+	if err := m.cutover(ctx, old, staged, manifest, stagingHost, captureBus.Specs(), captureGateway.Specs(), captureEndpoints.Specs(), captureClassifiers.Specs()); err != nil {
+		m.cleanupStaging(staged, stagingHost)
 		return err
 	}
 	return nil
+}
+
+// cleanupStaging 在重载失败时撤销暂存宿主并带超时停止新实例，避免 Stop 卡死永久持锁。
+func (m *Manager) cleanupStaging(staged contract.Plugin, host *pluginHost) {
+	host.revoke()
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), m.shutdownTimeout)
+	defer cancel()
+	completed := make(chan error, 1)
+	go func() { completed <- staged.Stop(cleanupCtx) }()
+	select {
+	case <-completed:
+	case <-cleanupCtx.Done():
+		if forceStopper, ok := staged.(contract.ForceStopper); ok {
+			_ = forceStopper.ForceStop()
+		}
+	}
 }
 
 func runPluginStart(ctx context.Context, plugin contract.Plugin, host contract.Host) error {
@@ -465,7 +531,7 @@ func runPluginStart(ctx context.Context, plugin contract.Plugin, host contract.H
 	}
 }
 
-func (m *Manager) cutover(ctx context.Context, old *managedPlugin, staged contract.Plugin, manifest contract.Manifest, stagingHost *pluginHost, subscriptions []eventbus.SubscriptionSpec, services []registry.ServiceSpec) error {
+func (m *Manager) cutover(ctx context.Context, old *managedPlugin, staged contract.Plugin, manifest contract.Manifest, stagingHost *pluginHost, subscriptions []eventbus.SubscriptionSpec, services []registry.ServiceSpec, endpoints []contract.EndpointInfo, classifiers []routing.ClassifierSpec) error {
 	old.lifecycle.Lock()
 	defer old.lifecycle.Unlock()
 	state, _ := m.State(manifest.ID)
@@ -483,16 +549,38 @@ func (m *Manager) cutover(ctx context.Context, old *managedPlugin, staged contra
 	}
 	oldServices := m.registry.SnapshotServices(manifest.ID)
 	oldSubscriptions := m.eventBus.SnapshotOwner(manifest.ID)
-	if err := m.registry.ReplaceServices(manifest.ID, services); err != nil {
+	oldEndpoints := endpointsOwnedBy(m.endpoints.List(), manifest.ID)
+	oldClassifiers := m.router.SnapshotClassifiers(manifest.ID)
+	// 旧实例已排空但尚未停止，先 fence 其清理调用，防止 Stop 删除新实例接管的同名资源。
+	old.host.fenced.Store(true)
+	restore := func() {
+		old.host.fenced.Store(false)
+		m.restorePluginResources(manifest.ID, oldEndpoints, oldClassifiers)
 		m.restoreOwner(manifest.ID, oldServices, oldSubscriptions)
+	}
+	if err := m.registry.ReplaceServices(manifest.ID, services); err != nil {
+		restore()
 		return err
 	}
 	if _, err := m.eventBus.ReplaceOwner(manifest.ID, subscriptions); err != nil {
-		m.restoreOwner(manifest.ID, oldServices, oldSubscriptions)
+		restore()
 		return err
 	}
-	if err := stagingHost.switchTo(m.eventBus.ViewForPlugin(manifest.ID), m.gateway.ViewForPlugin(manifest.ID)); err != nil {
-		m.restoreOwner(manifest.ID, oldServices, oldSubscriptions)
+	if err := m.replacePluginEndpoints(manifest.ID, endpoints); err != nil {
+		restore()
+		return err
+	}
+	if err := m.replacePluginClassifiers(manifest.ID, classifiers); err != nil {
+		restore()
+		return err
+	}
+	if err := stagingHost.switchTo(m.eventBus.ViewForPlugin(manifest.ID), m.gateway.ViewForPlugin(manifest.ID), m.endpoints, m.router); err != nil {
+		restore()
+		return err
+	}
+	// 规则在切换瞬间才替换；失败时旧规则仍在路由器中，旧实例继续使用。
+	if err := m.router.RegisterRules(manifest.ID, manifest.Routing); err != nil {
+		restore()
 		return err
 	}
 	if err := old.plugin.Stop(stopCtx); err != nil {
@@ -505,6 +593,53 @@ func (m *Manager) cutover(ctx context.Context, old *managedPlugin, staged contra
 	m.gateway.ActivateOwner(manifest.ID)
 	_ = m.registry.SetPluginState(manifest.ID, contract.PluginRunning)
 	return nil
+}
+
+// endpointsOwnedBy 过滤指定 owner 的端点快照。
+func endpointsOwnedBy(infos []contract.EndpointInfo, owner string) []contract.EndpointInfo {
+	result := make([]contract.EndpointInfo, 0, len(infos))
+	for _, info := range infos {
+		if info.Owner == owner {
+			result = append(result, info)
+		}
+	}
+	return result
+}
+
+// replacePluginEndpoints 用新实例捕获的端点替换旧实例端点；失败时清空已写入部分。
+func (m *Manager) replacePluginEndpoints(owner string, endpoints []contract.EndpointInfo) error {
+	m.endpoints.UnregisterOwner(owner)
+	for _, info := range endpoints {
+		if err := m.endpoints.Register(info); err != nil {
+			m.endpoints.UnregisterOwner(owner)
+			return fmt.Errorf("迁移插件 %s 的端点 %s: %w", owner, info.ID, err)
+		}
+	}
+	return nil
+}
+
+// replacePluginClassifiers 用新实例捕获的分类器替换旧实例分类器；失败时清空已写入部分。
+func (m *Manager) replacePluginClassifiers(owner string, classifiers []routing.ClassifierSpec) error {
+	m.router.UnregisterClassifiersByOwner(owner)
+	for _, spec := range classifiers {
+		if err := m.router.RegisterClassifierForOwner(owner, spec.ID, spec.Classifier); err != nil {
+			m.router.UnregisterClassifiersByOwner(owner)
+			return fmt.Errorf("迁移插件 %s 的分类器 %s: %w", owner, spec.ID, err)
+		}
+	}
+	return nil
+}
+
+// restorePluginResources 回滚失败切换前的端点与分类器。
+func (m *Manager) restorePluginResources(owner string, endpoints []contract.EndpointInfo, classifiers []routing.ClassifierSpec) {
+	m.endpoints.UnregisterOwner(owner)
+	for _, info := range endpoints {
+		_ = m.endpoints.Register(info)
+	}
+	m.router.UnregisterClassifiersByOwner(owner)
+	for _, spec := range classifiers {
+		_ = m.router.RegisterClassifierForOwner(owner, spec.ID, spec.Classifier)
+	}
 }
 
 func (m *Manager) StopAll(ctx context.Context) error {
@@ -692,12 +827,15 @@ type pluginHost struct {
 	logger           contract.Logger
 	botID            string
 	owner            string
-	endpoints        *endpoint.Registry
+	endpoints        endpointRegistrar
 	router           *routing.Router
+	classifiers      classifierRegistrar
 	allowedSubscribe map[string]struct{}
 	allowedInvoke    map[string]struct{}
 	allowedProvide   map[string]map[string]struct{}
 	active           atomic.Bool
+	// fenced 在热重载切换后置位：旧实例的清理调用不得再触碰已迁移给新实例的资源。
+	fenced atomic.Bool
 }
 
 func newPluginHost(
@@ -715,6 +853,7 @@ func newPluginHost(
 		owner:            manifest.ID,
 		endpoints:        nil,
 		router:           nil,
+		classifiers:      nil,
 		allowedSubscribe: makeStringSet(manifest.Provides.Subscriptions),
 		allowedInvoke:    makeStringSet(manifest.Requires.Services),
 		allowedProvide:   make(map[string]map[string]struct{}, len(manifest.Provides.Services)),
@@ -749,6 +888,10 @@ func (h *pluginHost) RegisterEndpoint(info contract.EndpointInfo) error {
 	return h.endpoints.Register(info)
 }
 func (h *pluginHost) UnregisterEndpoint(id string) error {
+	// 热重载完成后旧实例已 fenced，其清理不得删除新实例接管的同名端点。
+	if h.fenced.Load() {
+		return nil
+	}
 	if h.endpoints == nil {
 		return &contract.ServiceError{Code: contract.ErrorUnavailable, Message: "端点注册表不可用"}
 	}
@@ -762,6 +905,10 @@ func (h *pluginHost) RegisterRouteClassifier(id string, classifier contract.Rout
 	if err := h.ensureActive(); err != nil {
 		return err
 	}
+	// 暂存宿主优先写入捕获器，切换成功后再迁移到真实路由器。
+	if h.classifiers != nil {
+		return h.classifiers.RegisterClassifierForOwner(h.owner, id, classifier)
+	}
 	if h.router == nil {
 		return &contract.ServiceError{Code: contract.ErrorUnavailable, Message: "路由器不可用"}
 	}
@@ -769,6 +916,12 @@ func (h *pluginHost) RegisterRouteClassifier(id string, classifier contract.Rout
 }
 
 func (h *pluginHost) UnregisterRouteClassifier(id string) error {
+	if h.fenced.Load() {
+		return nil
+	}
+	if h.classifiers != nil {
+		return h.classifiers.UnregisterClassifier(id)
+	}
 	if h.router == nil {
 		return &contract.ServiceError{Code: contract.ErrorUnavailable, Message: "路由器不可用"}
 	}

@@ -126,6 +126,9 @@ type CandidateReply struct {
 	TargetBotID    string `json:"target_bot_id,omitempty" yaml:"target_bot_id,omitempty"`
 	Priority       int    `json:"priority,omitempty" yaml:"priority,omitempty"`
 	IdempotencyKey string `json:"idempotency_key,omitempty" yaml:"idempotency_key,omitempty"`
+	// DispatchSubject 是服务端内部填写的动作调用主体。
+	// 它不参与序列化，客户端载荷无法伪造；为空时回退到 ApplicationID。
+	DispatchSubject string `json:"-" yaml:"-"`
 }
 
 // DispatchPlan 是路由器计算出的投递计划。
